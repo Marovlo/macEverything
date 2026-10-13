@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 写入版本号
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $ver" app/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $ver" app/Info.plist
+
+      - name: 测试并打包
+        run: |
+          make build/maceverything-test
+          ./build/maceverything-test
+          make dmg
+
+      - name: 上传安装包
+        uses: actions/upload-artifact@v4
+        with:
+          name: MacEverything-dmg
+          path: build/MacEverything.dmg
+
+      - name: 发布到 Releases
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/MacEverything.dmg
+          generate_release_notes: true
+          body: |
+            下载 `MacEverything.dmg`，打开后把 MacEverything 拖到「应用程序」。
+
+            首次打开如果被系统拦住：在「应用程序」里对 MacEverything 右键，选择「打开」，再点「打开」。
+
+            已经装过的话，用新的应用替换旧的即可。索引还在原来的位置，不用重新授权完全磁盘访问（除非系统提示签名变了）。
