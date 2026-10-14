@@ -48,6 +48,8 @@ dmg: app
 	cp -R build/MacEverything.app build/dmg/
 	ln -s /Applications build/dmg/Applications
 	hdiutil create -volname MacEverything -srcfolder build/dmg -ov -format UDZO build/MacEverything.dmg
+	# 清理暂存的 .app 副本，避免 Spotlight 索引出重复应用
+	rm -rf build/dmg build/MacEverything.app
 
 test: build/maceverything-test app
 	./build/maceverything-test
