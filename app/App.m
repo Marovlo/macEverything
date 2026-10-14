@@ -534,7 +534,7 @@ static void OnIndexChange(void *ctx) {
   NSMenuItem *ctxReveal = [[NSMenuItem alloc] initWithTitle:@"在 Finder 中显示" action:@selector(reveal:) keyEquivalent:@""];
   ctxReveal.target = self;
   [ctx addItem:ctxReveal];
-  NSMenuItem *ctxPin = [[NSMenuItem alloc] initWithTitle:@"📌 固定到首页" action:@selector(pinToHome:) keyEquivalent:@""];
+  NSMenuItem *ctxPin = [[NSMenuItem alloc] initWithTitle:@"固定到首页 📌" action:@selector(pinToHome:) keyEquivalent:@""];
   ctxPin.target = self;
   [ctx addItem:ctxPin];
   NSMenuItem *ctxCopy = [[NSMenuItem alloc] initWithTitle:@"拷贝路径" action:@selector(copyPath:) keyEquivalent:@""];
@@ -771,9 +771,22 @@ static OSStatus HotkeyHandler(EventHandlerCallRef next, EventRef event, void *us
     free(self.resultIds);
     self.resultIds = NULL;
     self.resultCount = 0;
-    /* 首页展示搜索历史：词条行 + 缩进的文件行 */
+    /* 首页展示搜索历史：词条行 + 缩进的文件行。
+       含固定文件的词条始终排在最前，其余按最近使用排序。 */
     self.rows = [NSMutableArray array];
+    NSMutableArray *pinnedTerms = [NSMutableArray array];
+    NSMutableArray *plainTerms = [NSMutableArray array];
     for (NSDictionary *t in self.history) {
+      BOOL hasPin = NO;
+      for (NSDictionary *f in t[@"files"]) {
+        if ([f[@"pin"] boolValue]) {
+          hasPin = YES;
+          break;
+        }
+      }
+      [hasPin ? pinnedTerms : plainTerms addObject:t];
+    }
+    for (NSDictionary *t in [pinnedTerms arrayByAddingObjectsFromArray:plainTerms]) {
       MERow *tr = [MERow new];
       tr.isTerm = YES;
       tr.term = t[@"q"];
@@ -783,13 +796,11 @@ static OSStatus HotkeyHandler(EventHandlerCallRef next, EventRef event, void *us
       [self.rows addObject:tr];
       for (NSDictionary *f in t[@"files"]) {
         MERow *fr = [MERow new];
-        BOOL pinned = [f[@"pin"] boolValue];
-        NSString *baseName = f[@"n"] ?: @"";
-        fr.name = pinned ? [@"📌 " stringByAppendingString:baseName] : baseName;
+        fr.name = f[@"n"] ?: @"";
         fr.path = f[@"p"];
         fr.isDir = [f[@"d"] boolValue];
         fr.indent = 1;
-        fr.pinned = pinned;
+        fr.pinned = [f[@"pin"] boolValue];
         /* 实时 stat：文件被删后大小/时间留空 */
         NSDictionary *st = [NSFileManager.defaultManager attributesOfItemAtPath:fr.path error:NULL];
         if (st) {
@@ -1070,6 +1081,14 @@ static const uint32_t kSearchPage = 300;
       [cell addSubview:del];
       NSLayoutConstraint *delTrail =
           [del.trailingAnchor constraintEqualToAnchor:cell.trailingAnchor constant:-4];
+      NSImageView *pinIv = [NSImageView new];
+      pinIv.tag = 4;
+      pinIv.translatesAutoresizingMaskIntoConstraints = NO;
+      pinIv.hidden = YES;
+      NSImage *pinImg = [NSImage imageWithSystemSymbolName:@"pin.fill" accessibilityDescription:nil];
+      pinImg.size = NSMakeSize(14, 14);
+      pinIv.image = pinImg;
+      [cell addSubview:pinIv];
       [NSLayoutConstraint activateConstraints:@[
         [iv.leadingAnchor constraintEqualToAnchor:cell.leadingAnchor constant:2],
         [iv.widthAnchor constraintEqualToAnchor:cell.heightAnchor],
@@ -1079,6 +1098,10 @@ static const uint32_t kSearchPage = 300;
         [del.widthAnchor constraintEqualToConstant:16],
         [del.heightAnchor constraintEqualToConstant:16],
         delTrail,
+        [pinIv.centerYAnchor constraintEqualToAnchor:cell.centerYAnchor],
+        [pinIv.widthAnchor constraintEqualToConstant:14],
+        [pinIv.heightAnchor constraintEqualToConstant:14],
+        [pinIv.trailingAnchor constraintEqualToAnchor:iv.leadingAnchor constant:-5],
       ]];
     } else {
       [NSLayoutConstraint activateConstraints:@[
@@ -1094,6 +1117,8 @@ static const uint32_t kSearchPage = 300;
   NSImageView *iv = [cell viewWithTag:2];
   NSButton *del = [cell viewWithTag:3];
   del.hidden = !item.isTerm;
+  NSImageView *pinIv = [cell viewWithTag:4];
+  pinIv.hidden = !(rowValid && item.pinned);
   BOOL isNameCol = [ident isEqualToString:@"name"];
   if (isNameCol) {
     /* 历史页文件行按层级缩进名称列（图标与文字一起偏移）。
