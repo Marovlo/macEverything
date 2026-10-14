@@ -300,6 +300,22 @@ static void OnIndexChange(void *ctx) {
   [self scheduleSearch];
 }
 
+/* 点击词条行的 ✕：删除该词条及其文件记录。 */
+- (void)deleteHistoryTerm:(NSButton *)btn {
+  NSInteger row = [self.table rowForView:btn];
+  if (row < 0 || (NSUInteger)row >= self.rows.count || !self.history) return;
+  MERow *item = self.rows[(NSUInteger)row];
+  if (!item.isTerm) return;
+  for (NSUInteger ti = 0; ti < self.history.count; ti++) {
+    if ([self.history[ti][@"q"] isEqual:item.term]) {
+      [self.history removeObjectAtIndex:ti];
+      break;
+    }
+  }
+  [self saveHistory];
+  [self scheduleSearch];
+}
+
 - (void)useIndex:(MEIndex *)idx {
   dispatch_async(dispatch_get_main_queue(), ^{
     self.idx = idx;
@@ -740,9 +756,13 @@ static OSStatus HotkeyHandler(EventHandlerCallRef next, EventRef event, void *us
         fr.name = f[@"n"];
         fr.path = f[@"p"];
         fr.isDir = [f[@"d"] boolValue];
-        fr.sizeText = @"";
-        fr.timeText = @"";
         fr.indent = 1;
+        /* 实时 stat：文件被删后大小/时间留空 */
+        NSDictionary *st = [NSFileManager.defaultManager attributesOfItemAtPath:fr.path error:NULL];
+        if (st) {
+          if (!fr.isDir) fr.sizeText = FormatSize([st[NSFileSize] unsignedLongLongValue]);
+          fr.timeText = FormatTime([st[NSFileModificationDate] timeIntervalSince1970]);
+        }
         [self.rows addObject:fr];
       }
     }
@@ -850,6 +870,15 @@ static const uint32_t kSearchPage = 300;
   return (NSInteger)self.rows.count;
 }
 
+/* viewForTableColumn 对越界行返回 nil 时，表格退回单元格路径渲染；
+   必须提供空值兜底，否则 nil 值进 NSCell 格式化会抛异常。 */
+- (id)tableView:(NSTableView *)tableView objectValueForTableColumn:(NSTableColumn *)column row:(NSInteger)row {
+  (void)tableView;
+  (void)column;
+  (void)row;
+  return @"";
+}
+
 /* 计算文件名中需要高亮的区间，语义与搜索一致：多词 AND、!排除不参与、
  * 大小写/音调/全半角不敏感、* ? 通配。 */
 - (NSMutableIndexSet *)highlightRangesForName:(NSString *)name {
@@ -913,6 +942,13 @@ static const uint32_t kSearchPage = 300;
 - (NSAttributedString *)highlightedName:(NSString *)name {
   NSMutableParagraphStyle *para = [NSMutableParagraphStyle new];
   para.lineBreakMode = NSLineBreakByTruncatingTail;
+  if (name.length == 0) {
+    return [[NSAttributedString alloc] initWithString:@"" attributes:@{
+      NSFontAttributeName : [NSFont systemFontOfSize:13],
+      NSForegroundColorAttributeName : NSColor.secondaryLabelColor,
+      NSParagraphStyleAttributeName : para,
+    }];
+  }
   NSMutableAttributedString *as =
       [[NSMutableAttributedString alloc] initWithString:name attributes:@{
         NSFontAttributeName : [NSFont systemFontOfSize:13],
@@ -951,9 +987,25 @@ static const uint32_t kSearchPage = 300;
 }
 
 - (NSView *)tableView:(NSTableView *)tableView viewForTableColumn:(NSTableColumn *)column row:(NSInteger)row {
-  (void)tableView;
-  if (row < 0 || (NSUInteger)row >= self.rows.count) return nil;
-  MERow *item = self.rows[(NSUInteger)row];
+  @try {
+    return [self tableView:tableView viewForTableColumnHelper:column row:row];
+  } @catch (NSException *e) {
+    FILE *f = fopen("/tmp/me-view-err.log", "a");
+    if (f) {
+      fprintf(f, "%s\n", e.reason.UTF8String ?: "unknown");
+      fclose(f);
+    }
+    NSTableCellView *blank = [[NSTableCellView alloc] initWithFrame:NSZeroRect];
+    return blank;
+  }
+}
+
+- (NSView *)tableView:(NSTableView *)tableView
+    viewForTableColumnHelper:(NSTableColumn *)column
+                          row:(NSInteger)row {
+  /* 越界行渲染空内容，不返回 nil（nil 会触发单元格兜底路径） */
+  BOOL rowValid = row >= 0 && (NSUInteger)row < self.rows.count;
+  MERow *item = rowValid ? self.rows[(NSUInteger)row] : [MERow new];
   NSString *ident = column.identifier;
   NSTableCellView *cell = [tableView makeViewWithIdentifier:ident owner:self];
   if (!cell) {
@@ -975,11 +1027,25 @@ static const uint32_t kSearchPage = 300;
       [cell addSubview:iv];
       NSLayoutConstraint *lead =
           [tf.leadingAnchor constraintEqualToAnchor:iv.trailingAnchor constant:6];
+      NSImage *ximg = [NSImage imageWithSystemSymbolName:@"xmark.circle"
+                                  accessibilityDescription:@"删除该搜索历史"];
+      NSButton *del = [NSButton buttonWithImage:ximg target:self action:@selector(deleteHistoryTerm:)];
+      del.tag = 3;
+      del.bordered = NO;
+      del.hidden = YES;
+      del.translatesAutoresizingMaskIntoConstraints = NO;
+      [cell addSubview:del];
+      NSLayoutConstraint *delTrail =
+          [del.trailingAnchor constraintEqualToAnchor:cell.trailingAnchor constant:-4];
       [NSLayoutConstraint activateConstraints:@[
         [iv.leadingAnchor constraintEqualToAnchor:cell.leadingAnchor constant:2],
         [iv.widthAnchor constraintEqualToAnchor:cell.heightAnchor],
         [iv.centerYAnchor constraintEqualToAnchor:cell.centerYAnchor],
         lead,
+        [del.centerYAnchor constraintEqualToAnchor:cell.centerYAnchor],
+        [del.widthAnchor constraintEqualToConstant:16],
+        [del.heightAnchor constraintEqualToConstant:16],
+        delTrail,
       ]];
     } else {
       [NSLayoutConstraint activateConstraints:@[
@@ -993,16 +1059,28 @@ static const uint32_t kSearchPage = 300;
   }
   NSTextField *tf = [cell viewWithTag:1];
   NSImageView *iv = [cell viewWithTag:2];
+  NSButton *del = [cell viewWithTag:3];
+  del.hidden = !item.isTerm;
   BOOL isNameCol = [ident isEqualToString:@"name"];
   if (isNameCol) {
-    /* 历史页文件行按层级缩进名称列（图标与文字一起偏移） */
+    /* 历史页文件行按层级缩进名称列（图标与文字一起偏移）。
+       viewForTableColumn 在布局事务内被调用，约束不能就地改，延迟到下一轮 runloop。 */
+    CGFloat leadWanted = 6 + 18.0 * item.indent;
+    CGFloat trailWanted = -4 - (item.isTerm ? 22 : 0);
+    CGFloat ivWanted = 2 + 18.0 * item.indent;
+    NSLayoutConstraint *leadC = nil, *trailC = nil, *ivLeadC = nil;
     for (NSLayoutConstraint *c in cell.constraints) {
-      if (c.firstItem == tf && c.firstAttribute == NSLayoutAttributeLeading) {
-        c.constant = 6 + 18.0 * item.indent;
-      }
-      if (c.firstItem == iv && c.firstAttribute == NSLayoutAttributeLeading) {
-        c.constant = 2 + 18.0 * item.indent;
-      }
+      if (c.firstItem == tf && c.firstAttribute == NSLayoutAttributeLeading) leadC = c;
+      if (c.firstItem == tf && c.firstAttribute == NSLayoutAttributeTrailing) trailC = c;
+      if (c.firstItem == iv && c.firstAttribute == NSLayoutAttributeLeading) ivLeadC = c;
+    }
+    if (leadC.constant != leadWanted || trailC.constant != trailWanted ||
+        ivLeadC.constant != ivWanted) {
+      dispatch_async(dispatch_get_main_queue(), ^{
+        leadC.constant = leadWanted;
+        trailC.constant = trailWanted;
+        ivLeadC.constant = ivWanted;
+      });
     }
   }
   if (item.isTerm) {
@@ -1033,16 +1111,16 @@ static const uint32_t kSearchPage = 300;
     tf.attributedStringValue = [self highlightedName:item.name];
     iv.image = [self iconFor:item];
   } else if ([ident isEqualToString:@"path"]) {
-    tf.stringValue = item.isTerm ? @"" : item.path;
+    tf.stringValue = item.isTerm ? @"" : (item.path ?: @"");
     tf.textColor = NSColor.secondaryLabelColor;
   } else if ([ident isEqualToString:@"size"]) {
-    tf.stringValue = item.isTerm ? @"" : item.sizeText;
+    tf.stringValue = item.isTerm ? @"" : (item.sizeText ?: @"");
     tf.textColor = NSColor.secondaryLabelColor;
   } else {
-    tf.stringValue = item.isTerm ? @"" : item.timeText;
+    tf.stringValue = item.isTerm ? @"" : (item.timeText ?: @"");
     tf.textColor = NSColor.secondaryLabelColor;
   }
-  cell.toolTip = item.isTerm ? nil : item.path;
+  cell.toolTip = (rowValid && !item.isTerm) ? item.path : nil;
   return cell;
 }
 
