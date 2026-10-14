@@ -138,6 +138,39 @@ static void OnIndexChange(void *ctx) {
   [self finishLaunch];
 }
 
+/* 探测桌面目录是否被 TCC 拦截（拒绝时 openat 会阻塞，须在后台线程探测）。 */
+- (BOOL)fdaLikelyDenied {
+  NSString *desktop = [NSHomeDirectory() stringByAppendingPathComponent:@"Desktop"];
+  dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+  __block BOOL denied = NO;
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    NSError *err = nil;
+    [NSFileManager.defaultManager contentsOfDirectoryAtPath:desktop error:&err];
+    denied = err != nil;
+    dispatch_semaphore_signal(sem);
+  });
+  BOOL got = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW,
+                                                        (int64_t)(0.4 * NSEC_PER_SEC))) == 0;
+  return got ? denied : YES; /* 超时未返回 = 被 TCC 挡住 */
+}
+
+/* 首次启动且检测到受保护目录不可读时，引导用户授予完全磁盘访问（只提示一次）。 */
+- (void)maybePromptForFDA {
+  NSString *askedKey = @"MEAskedFDA1";
+  if ([NSUserDefaults.standardUserDefaults boolForKey:askedKey]) return;
+  [NSUserDefaults.standardUserDefaults setBool:YES forKey:askedKey];
+  if (![self fdaLikelyDenied]) return;
+  NSAlert *alert = [NSAlert new];
+  alert.messageText = @"授予完全磁盘访问权限";
+  alert.informativeText =
+      @"MacEverything 需要完全磁盘访问权限，才能搜索桌面、文稿、下载等受保护目录。\n\n"
+       "现在去系统设置授权吗？授权后需要重新打开应用生效。";
+  [alert addButtonWithTitle:@"打开系统设置"];
+  [alert addButtonWithTitle:@"以后再说"];
+  alert.alertStyle = NSAlertStyleInformational;
+  if ([alert runModal] == NSAlertFirstButtonReturn) [self openPrivacy];
+}
+
 - (void)finishLaunch {
   [self buildStatus];
   [self loadHistory];
@@ -160,6 +193,11 @@ static void OnIndexChange(void *ctx) {
   [NSTimer scheduledTimerWithTimeInterval:10 target:self selector:@selector(checkpoint) userInfo:nil repeats:YES];
   [NSTimer scheduledTimerWithTimeInterval:3600 target:self selector:@selector(checkForUpdates) userInfo:nil repeats:YES];
   [self checkForUpdates];
+  /* 窗口就绪后延迟 1 秒，首次启动引导完全磁盘访问 */
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                 dispatch_get_main_queue(), ^{
+                   [self maybePromptForFDA];
+                 });
 }
 
 - (BOOL)hasLaunchFlag:(NSString *)flag {
@@ -1031,22 +1069,6 @@ static const uint32_t kSearchPage = 300;
 }
 
 - (NSView *)tableView:(NSTableView *)tableView viewForTableColumn:(NSTableColumn *)column row:(NSInteger)row {
-  @try {
-    return [self tableView:tableView viewForTableColumnHelper:column row:row];
-  } @catch (NSException *e) {
-    FILE *f = fopen("/tmp/me-view-err.log", "a");
-    if (f) {
-      fprintf(f, "%s\n", e.reason.UTF8String ?: "unknown");
-      fclose(f);
-    }
-    NSTableCellView *blank = [[NSTableCellView alloc] initWithFrame:NSZeroRect];
-    return blank;
-  }
-}
-
-- (NSView *)tableView:(NSTableView *)tableView
-    viewForTableColumnHelper:(NSTableColumn *)column
-                          row:(NSInteger)row {
   /* 越界行渲染空内容，不返回 nil（nil 会触发单元格兜底路径） */
   BOOL rowValid = row >= 0 && (NSUInteger)row < self.rows.count;
   MERow *item = rowValid ? self.rows[(NSUInteger)row] : [MERow new];
@@ -1116,9 +1138,11 @@ static const uint32_t kSearchPage = 300;
   NSTextField *tf = [cell viewWithTag:1];
   NSImageView *iv = [cell viewWithTag:2];
   NSButton *del = [cell viewWithTag:3];
-  del.hidden = !item.isTerm;
   NSImageView *pinIv = [cell viewWithTag:4];
+  del.hidden = !item.isTerm;
   pinIv.hidden = !(rowValid && item.pinned);
+  /* 兜底防御：复用/外来单元格若带格式器，setStringValue 会触发格式化异常 */
+  if (tf.formatter) tf.formatter = nil;
   BOOL isNameCol = [ident isEqualToString:@"name"];
   if (isNameCol) {
     /* 历史页文件行按层级缩进名称列（图标与文字一起偏移）。
