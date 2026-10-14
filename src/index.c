@@ -793,11 +793,14 @@ int me_index_scanning(const MEIndex *idx) {
 void me_index_set_complete(MEIndex *idx, int complete) {
   if (!idx) return;
   int v = complete ? 1 : 0;
-  if (idx->complete == v) return;
-  idx->complete = v;
+  int cur = atomic_load_explicit(&idx->complete, memory_order_relaxed);
+  if (cur == v) return;
+  atomic_store_explicit(&idx->complete, v, memory_order_relaxed);
   idx->dirty = 1;
 }
-int me_index_complete(const MEIndex *idx) { return idx && idx->complete; }
+int me_index_complete(const MEIndex *idx) {
+  return idx && atomic_load_explicit((atomic_int *)&idx->complete, memory_order_relaxed) != 0;
+}
 int me_index_is_mapped(const MEIndex *idx) {
   if (!idx) return 0;
   read_lock(idx);

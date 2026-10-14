@@ -186,43 +186,18 @@ int me_index_save(MEIndex *idx, const char *path) {
       me_write_full(fd, roots, (size_t)idx->root_count * sizeof(MEDiskRoot)) != 0) {
     rc = -1;
   }
-  if (rc == 0) {
-    uint64_t pos = 256 + (uint64_t)idx->root_count * sizeof(MEDiskRoot);
-    while (pos < hdr.keys_offset) {
-      char z = 0;
-      if (me_write_full(fd, &z, 1) != 0) rc = -1;
-      pos++;
-    }
-  }
+  if (rc == 0 && lseek(fd, hdr.keys_offset, SEEK_SET) < 0) rc = -1;
   if (rc == 0 && idx->count && me_write_full(fd, idx->keys, (size_t)idx->count * sizeof(MEKey)) != 0)
     rc = -1;
-  if (rc == 0) {
-    uint64_t pos = hdr.keys_offset + (uint64_t)idx->count * sizeof(MEKey);
-    while (pos < hdr.nodes_offset) {
-      char z = 0;
-      if (me_write_full(fd, &z, 1) != 0) rc = -1;
-      pos++;
-    }
-  }
+  if (rc == 0 && lseek(fd, hdr.nodes_offset, SEEK_SET) < 0) rc = -1;
   if (rc == 0 && idx->count && me_write_full(fd, idx->nodes, (size_t)idx->count * sizeof(MENode)) != 0)
     rc = -1;
-  if (rc == 0) {
-    uint64_t pos = hdr.nodes_offset + (uint64_t)idx->count * sizeof(MENode);
-    while (pos < hdr.blob_offset) {
-      char z = 0;
-      if (me_write_full(fd, &z, 1) != 0) rc = -1;
-      pos++;
-    }
-  }
+  if (rc == 0 && lseek(fd, hdr.blob_offset, SEEK_SET) < 0) rc = -1;
   if (rc == 0 && idx->blob_len && me_write_full(fd, idx->blob, idx->blob_len) != 0) rc = -1;
   if (rc == 0) {
     if (lseek(fd, 0, SEEK_SET) < 0 || me_write_full(fd, &hdr, sizeof hdr) != 0) rc = -1;
   }
   if (rc == 0 && fsync(fd) != 0) rc = -1;
-  if (rc == 0) {
-    idx->dirty = 0;
-    write_sidecar(path, idx);
-  }
   pthread_rwlock_unlock(&idx->lock);
   close(fd);
   if (rc != 0) {
@@ -234,6 +209,12 @@ int me_index_save(MEIndex *idx, const char *path) {
     me_set_error("rename index failed");
     return -1;
   }
+  /* rename 成功后才清 dirty；用写锁避免与并发读者/写者竞争。 */
+  pthread_rwlock_wrlock(&idx->lock);
+  idx->dirty = 0;
+  write_sidecar(path, idx);
+  idx->eid_dirty = 0;
+  pthread_rwlock_unlock(&idx->lock);
   return 0;
 }
 
@@ -313,7 +294,7 @@ MEIndex *me_index_load(const char *path) {
     if (!(idx->keys[i].flags & ME_F_DEAD)) live++;
   }
   idx->live = live;
-  idx->complete = hdr.reserved == 1;
+  atomic_store_explicit(&idx->complete, hdr.reserved == 1 ? 1 : 0, memory_order_relaxed);
   for (uint32_t i = 0; i < hdr.root_count; i++) {
     MEDiskRoot disk;
     memcpy(&disk, (char *)map + 256 + (size_t)i * sizeof(MEDiskRoot), sizeof disk);

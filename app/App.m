@@ -1,12 +1,17 @@
 #import <AppKit/AppKit.h>
 #import <Carbon/Carbon.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 #include "me.h"
 
+#include <spawn.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+extern char **environ;
 
 static _Atomic uint64_t g_epoch = 0;
 
@@ -15,12 +20,13 @@ static _Atomic uint64_t g_epoch = 0;
 @property(copy) NSString *path;
 @property(copy) NSString *sizeText;
 @property(copy) NSString *timeText;
+@property BOOL isDir;
 @end
 
 @implementation MERow
 @end
 
-@interface AppDelegate : NSObject <NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate, NSWindowDelegate, NSTextFieldDelegate, NSSearchFieldDelegate>
+@interface AppDelegate : NSObject <NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate, NSWindowDelegate, NSTextFieldDelegate, NSSearchFieldDelegate, NSMenuItemValidation, NSMenuDelegate>
 @property(strong) NSStatusItem *status;
 @property(strong) NSWindow *window;
 @property(strong) NSSearchField *field;
@@ -37,22 +43,17 @@ static _Atomic uint64_t g_epoch = 0;
 @property BOOL ready;
 @property BOOL skipSave;
 @property BOOL updateCheckInFlight;
+@property BOOL searchLoading;
+@property BOOL quitting;
+@property uint32_t searchTotal;
+@property(nonatomic, assign) NSInteger meSortKey;
+@property BOOL meSortAsc;
+@property(nonatomic, assign) uint32_t *resultIds;  /* 搜索结果缓存，按当前排序，主线程持有 */
+@property NSUInteger resultCount;
 @property BOOL skippedProtected;
 @property(strong) NSScrollView *listScroll;
-@property dispatch_queue_t listQ;
-@property uint32_t *sortedIds;
-@property uint32_t sortedCount;
-@property uint64_t sortedGen;
-@property(nonatomic, assign) MEIndex *sortedIdx;
-@property BOOL sorting;
-@property BOOL sortAgain;
-@property BOOL showAll;
-@property NSUInteger windowStart;
-@property NSInteger scrollDelta;
-@property BOOL scrollScheduled;
-@property BOOL adjustingScroller;
-@property uint64_t seenGeneration;
 @property(strong) NSMenuItem *countItem;
+@property(strong) NSMutableDictionary<NSString *, NSImage *> *iconCache;
 @end
 
 static AppDelegate *g_app = nil;
@@ -62,7 +63,14 @@ static AppDelegate *g_app = nil;
 @property(nonatomic, weak) AppDelegate *owner;
 @end
 
+@class AppDelegate;
+@interface METableView : NSTableView
+@property(nonatomic, weak) AppDelegate *owner;
+@end
+
 @implementation AppDelegate
+
+static NSString * const MEActivateNotification = @"com.marovlo.macEverything.activate";
 
 static NSString *FormatSize(uint64_t n) {
   if (n < 1024) return [NSString stringWithFormat:@"%llu B", (unsigned long long)n];
@@ -82,8 +90,8 @@ static NSString *FormatTime(int64_t sec) {
   static dispatch_once_t once;
   dispatch_once(&once, ^{
     fmt = [NSDateFormatter new];
-    fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
-    fmt.dateFormat = @"yyyy-MM-dd HH:mm";
+    fmt.dateStyle = NSDateFormatterShortStyle;
+    fmt.timeStyle = NSDateFormatterShortStyle;
   });
   return [fmt stringFromDate:[NSDate dateWithTimeIntervalSince1970:sec]];
 }
@@ -91,19 +99,43 @@ static NSString *FormatTime(int64_t sec) {
 static void OnIndexChange(void *ctx) {
   (void)ctx;
   dispatch_async(dispatch_get_main_queue(), ^{
-    [g_app refreshIfVisible];
+    [g_app tick];
   });
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)note {
   (void)note;
   g_app = self;
+  self.meSortAsc = YES; /* 默认按名称升序 */
   [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
   self.rows = [NSMutableArray array];
   self.searchQ = dispatch_queue_create("maceverything.search", DISPATCH_QUEUE_SERIAL);
   self.saveQ = dispatch_queue_create("maceverything.save", DISPATCH_QUEUE_SERIAL);
-  self.listQ = dispatch_queue_create("maceverything.list", DISPATCH_QUEUE_SERIAL);
+  [[NSDistributedNotificationCenter defaultCenter] addObserver:self
+                                                      selector:@selector(peerActivate:)
+                                                           name:MEActivateNotification
+                                                         object:nil];
+  if ([NSBundle.mainBundle.bundlePath hasPrefix:@"/Volumes/"] && ![self hasLaunchFlag:@"--from-install"]) {
+    [self installToApplicationsAndRelaunch];
+    return;
+  }
+  if (![self wantsRescan] && ![self hasLaunchFlag:@"--from-install"]) {
+    [[NSDistributedNotificationCenter defaultCenter] postNotificationName:MEActivateNotification
+                                                                   object:nil
+                                                                 userInfo:nil
+                                                      deliverImmediately:YES];
+    if ([self runningPeerCount] > 0) {
+      [NSApp terminate:nil];
+      return;
+    }
+  }
+  [self finishLaunch];
+}
+
+- (void)finishLaunch {
   [self buildStatus];
+  if (getenv("ME_STATUS_ONLY")) return;
+  [self buildMainMenu];
   [self buildWindow];
   [self registerHotkey];
   [self showWindow];
@@ -124,6 +156,72 @@ static void OnIndexChange(void *ctx) {
   [self checkForUpdates];
 }
 
+- (BOOL)hasLaunchFlag:(NSString *)flag {
+  for (NSString *arg in NSProcessInfo.processInfo.arguments) {
+    if ([arg isEqualToString:flag]) return YES;
+  }
+  return NO;
+}
+
+- (NSUInteger)runningPeerCount {
+  NSString *bid = NSBundle.mainBundle.bundleIdentifier;
+  NSUInteger n = 0;
+  for (NSRunningApplication *app in NSWorkspace.sharedWorkspace.runningApplications) {
+    if (app.processIdentifier == getpid()) continue;
+    if ([app.bundleIdentifier isEqualToString:bid]) n++;
+  }
+  return n;
+}
+
+- (void)peerActivate:(NSNotification *)note {
+  (void)note;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    [self showWindow];
+  });
+}
+
+// 从 DMG（/Volumes）启动时，把最新副本替换安装到 /Applications 再重启，避免旧副本一直留着。
+- (void)installToApplicationsAndRelaunch {
+  NSURL *src = NSBundle.mainBundle.bundleURL;
+  NSURL *dst = [[NSURL fileURLWithPath:@"/Applications"] URLByAppendingPathComponent:src.lastPathComponent];
+  NSFileManager *fm = NSFileManager.defaultManager;
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:6];
+    for (;;) {
+      BOOL any = NO;
+      for (NSRunningApplication *app in NSWorkspace.sharedWorkspace.runningApplications) {
+        if (app.processIdentifier == getpid()) continue;
+        if ([app.bundleIdentifier isEqualToString:NSBundle.mainBundle.bundleIdentifier]) {
+          any = YES;
+          [app terminate];
+        }
+      }
+      if (!any || [NSDate.date timeIntervalSinceDate:deadline] >= 0) break;
+      [NSThread sleepForTimeInterval:0.2];
+    }
+    [fm removeItemAtURL:dst error:NULL];
+    BOOL ok = [fm copyItemAtURL:src toURL:dst error:NULL];
+    dispatch_async(dispatch_get_main_queue(), ^{
+      if (!ok) {
+        [self finishLaunch];
+        return;
+      }
+      // 不能直接 openApplicationAtURL：自己还活着时 LS 会把请求路由给运行中的实例。
+      // 派生一个独立小进程，等自己完全退出后再打开安装好的副本（普通启动路径）。
+      pid_t child = -1;
+      char *argv[] = {"/bin/sh", "-c", (char *)[[NSString stringWithFormat:
+          @"while kill -0 %d 2>/dev/null; do sleep 0.2; done; open %@", getpid(), dst.path] UTF8String], NULL};
+      int rc = posix_spawn(&child, "/bin/sh", NULL, NULL, argv, environ);
+      if (rc != 0) {
+        [self finishLaunch];
+        return;
+      }
+      self.skipSave = YES;
+      [NSApp terminate:nil];
+    });
+  });
+}
+
 - (BOOL)wantsRescan {
   for (NSString *arg in NSProcessInfo.processInfo.arguments) {
     if ([arg isEqualToString:@"--rescan"]) return YES;
@@ -141,7 +239,6 @@ static void OnIndexChange(void *ctx) {
   dispatch_async(dispatch_get_main_queue(), ^{
     self.idx = idx;
     self.ready = YES;
-    self.seenGeneration = me_index_generation(idx);
     [self tick];
     if (self.window.isVisible) [self scheduleSearch];
   });
@@ -162,12 +259,10 @@ static void OnIndexChange(void *ctx) {
     self.skippedProtected = skipped;
     self.idx = fresh;
     self.ready = YES;
-    self.seenGeneration = me_index_generation(fresh);
     [self tick];
     if (self.window.isVisible) [self scheduleSearch];
     if (old && old != fresh) {
       dispatch_async(self.searchQ, ^{
-        dispatch_sync(self.listQ, ^{});
         me_index_free(old);
       });
     }
@@ -230,18 +325,13 @@ static void OnIndexChange(void *ctx) {
 }
 
 - (void)buildStatus {
-  self.status = [NSStatusBar.systemStatusBar statusItemWithLength:NSSquareStatusItemLength];
-  NSImage *appIcon = nil;
-  NSString *iconPath = [NSBundle.mainBundle pathForResource:@"AppIcon" ofType:@"icns"];
-  if (iconPath.length) appIcon = [[NSImage alloc] initWithContentsOfFile:iconPath];
-  if (appIcon) [NSApp setApplicationIconImage:appIcon];
-  NSImage *image = nil;
-  NSString *barPath = [NSBundle.mainBundle pathForResource:@"MenubarIcon" ofType:@"png"];
-  if (barPath.length) image = [[NSImage alloc] initWithContentsOfFile:barPath];
-  if (!image) image = [NSImage imageWithSystemSymbolName:@"magnifyingglass" accessibilityDescription:@"MacEverything"];
+  self.status = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
+  NSImage *image = [NSImage imageWithSystemSymbolName:@"magnifyingglass" accessibilityDescription:@"MacEverything"];
   image.template = YES;
-  image.size = NSMakeSize(18, 18);
   self.status.button.image = image;
+  self.status.button.imagePosition = NSImageLeft;
+  self.status.button.title = @"ME";
+  self.status.visible = YES;
   NSMenu *menu = [NSMenu new];
   NSMenuItem *show = [[NSMenuItem alloc] initWithTitle:@"搜索" action:@selector(showWindow) keyEquivalent:@""];
   show.target = self;
@@ -279,25 +369,27 @@ static void OnIndexChange(void *ctx) {
     [self.menu popUpMenuPositioningItem:nil atLocation:origin inView:self.status.button];
     return;
   }
-  if (self.window.isVisible && self.window.isKeyWindow) [self.window orderOut:nil];
+  BOOL shown = self.window.isVisible && !self.window.miniaturized && self.window.isKeyWindow;
+  if (shown) [self.window orderOut:nil];
   else [self showWindow];
 }
 
 - (void)buildWindow {
-  NSRect frame = NSMakeRect(0, 0, 920, 560);
+  NSRect frame = NSMakeRect(0, 0, 1080, 600);
   self.window = [[NSWindow alloc] initWithContentRect:frame
                                             styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                                                       NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
                                               backing:NSBackingStoreBuffered
                                                 defer:NO];
   self.window.title = @"MacEverything";
-  self.window.level = NSFloatingWindowLevel;
   self.window.delegate = self;
   self.window.collectionBehavior = NSWindowCollectionBehaviorMoveToActiveSpace | NSWindowCollectionBehaviorFullScreenAuxiliary;
+  self.window.contentMinSize = NSMakeSize(520, 260);
+  self.window.frameAutosaveName = @"MESearchWindow";
   [self.window center];
   NSView *content = self.window.contentView;
   self.field = [NSSearchField new];
-  self.field.placeholderString = @"文件名";
+  self.field.placeholderString = @"输入文件名搜索";
   self.field.delegate = self;
   self.field.font = [NSFont systemFontOfSize:16];
   self.field.sendsSearchStringImmediately = NO;
@@ -308,8 +400,9 @@ static void OnIndexChange(void *ctx) {
   scroll.hasVerticalScroller = YES;
   scroll.autohidesScrollers = NO;
   self.listScroll = scroll;
-  self.table = [[NSTableView alloc] initWithFrame:NSZeroRect];
-  self.table.headerView = nil;
+  METableView *table = [[METableView alloc] initWithFrame:NSZeroRect];
+  table.owner = self;
+  self.table = table;
   self.table.rowHeight = 22;
   self.table.usesAlternatingRowBackgroundColors = YES;
   self.table.doubleAction = @selector(open:);
@@ -318,13 +411,30 @@ static void OnIndexChange(void *ctx) {
   self.table.delegate = self;
   NSArray *titles = @[@"名称", @"路径", @"大小", @"修改时间"];
   NSArray *ids = @[@"name", @"path", @"size", @"time"];
-  CGFloat widths[] = {180, 480, 80, 140};
+  NSArray *sortKeys = @[@"name", @"path", @"size", @"mtime"];
+  CGFloat widths[] = {220, 500, 90, 160};
   for (NSUInteger i = 0; i < titles.count; i++) {
     NSTableColumn *col = [[NSTableColumn alloc] initWithIdentifier:ids[i]];
     col.title = titles[i];
     col.width = widths[i];
+    col.resizingMask = [ids[i] isEqualToString:@"path"] ? NSTableColumnAutoresizingMask
+                                                        : NSTableColumnUserResizingMask;
+    col.sortDescriptorPrototype = [[NSSortDescriptor alloc] initWithKey:sortKeys[i] ascending:YES];
     [self.table addTableColumn:col];
   }
+  NSMenu *ctx = [NSMenu new];
+  NSMenuItem *ctxOpen = [[NSMenuItem alloc] initWithTitle:@"打开" action:@selector(open:) keyEquivalent:@""];
+  ctxOpen.target = self;
+  [ctx addItem:ctxOpen];
+  NSMenuItem *ctxReveal = [[NSMenuItem alloc] initWithTitle:@"在 Finder 中显示" action:@selector(reveal:) keyEquivalent:@""];
+  ctxReveal.target = self;
+  [ctx addItem:ctxReveal];
+  NSMenuItem *ctxCopy = [[NSMenuItem alloc] initWithTitle:@"拷贝路径" action:@selector(copyPath:) keyEquivalent:@""];
+  ctxCopy.target = self;
+  [ctx addItem:ctxCopy];
+  ctx.autoenablesItems = NO; /* 可用状态由 prepareContextMenuForEvent 显式控制 */
+  ctx.delegate = self;
+  self.table.menu = ctx;
   scroll.documentView = self.table;
   [content addSubview:scroll];
   self.footer = [NSTextField labelWithString:@"输入文件名"];
@@ -362,9 +472,84 @@ static OSStatus HotkeyHandler(EventHandlerCallRef next, EventRef event, void *us
 - (void)registerHotkey {
   EventHotKeyID hid = {'MEVY', 1};
   EventHotKeyRef ref = NULL;
-  RegisterEventHotKey(kVK_Space, controlKey | optionKey, hid, GetApplicationEventTarget(), 0, &ref);
+  OSStatus err = RegisterEventHotKey(kVK_Space, controlKey | optionKey, hid, GetApplicationEventTarget(), 0, &ref);
   EventTypeSpec spec = {kEventClassKeyboard, kEventHotKeyPressed};
   InstallApplicationEventHandler(HotkeyHandler, 1, &spec, NULL, NULL);
+  if (err != noErr) {
+    self.footer.stringValue = @"全局快捷键 ⌃⌥Space 注册失败，可能被其他应用占用";
+  }
+}
+
+// LSUIElement 应用也需要主菜单，⌘Q/⌘W/⌘C 等键位等效只有通过主菜单才全局生效。
+- (void)buildMainMenu {
+  NSMenu *main = [NSMenu new];
+
+  NSMenuItem *appItem = [[NSMenuItem alloc] initWithTitle:@"" action:NULL keyEquivalent:@""];
+  NSMenu *appMenu = [[NSMenu alloc] initWithTitle:@"MacEverything"];
+  [appMenu addItemWithTitle:@"关于 MacEverything" action:@selector(orderFrontStandardAboutPanel:) keyEquivalent:@""];
+  [appMenu addItem:[NSMenuItem separatorItem]];
+  [appMenu addItemWithTitle:@"隐藏 MacEverything" action:@selector(hide:) keyEquivalent:@"h"];
+  [appMenu addItemWithTitle:@"退出 MacEverything" action:@selector(terminate:) keyEquivalent:@"q"];
+  appItem.submenu = appMenu;
+  [main addItem:appItem];
+
+  NSMenuItem *fileItem = [[NSMenuItem alloc] initWithTitle:@"文件" action:NULL keyEquivalent:@""];
+  NSMenu *fileMenu = [[NSMenu alloc] initWithTitle:@"文件"];
+  [fileMenu addItemWithTitle:@"搜索" action:@selector(focusSearch) keyEquivalent:@"f"];
+  [fileMenu addItem:[NSMenuItem separatorItem]];
+  [fileMenu addItemWithTitle:@"在 Finder 中显示" action:@selector(reveal:) keyEquivalent:@"r"];
+  [fileMenu addItem:[NSMenuItem separatorItem]];
+  [fileMenu addItemWithTitle:@"关闭窗口" action:@selector(performClose:) keyEquivalent:@"w"];
+  fileItem.submenu = fileMenu;
+  [main addItem:fileItem];
+
+  NSMenuItem *editItem = [[NSMenuItem alloc] initWithTitle:@"编辑" action:NULL keyEquivalent:@""];
+  NSMenu *editMenu = [[NSMenu alloc] initWithTitle:@"编辑"];
+  [editMenu addItemWithTitle:@"拷贝路径" action:@selector(copy:) keyEquivalent:@"c"];
+  editItem.submenu = editMenu;
+  [main addItem:editItem];
+
+  NSApp.mainMenu = main;
+}
+
+- (void)focusSearch {
+  if (!self.window.isVisible) [self showWindow];
+  [self.window makeFirstResponder:self.field];
+}
+
+- (void)copyPath:(id)sender {
+  (void)sender;
+  NSInteger row = self.table.selectedRow;
+  if (row < 0 || (NSUInteger)row >= self.rows.count) return;
+  [NSPasteboard.generalPasteboard clearContents];
+  [NSPasteboard.generalPasteboard setString:self.rows[(NSUInteger)row].path forType:NSPasteboardTypeString];
+}
+
+- (BOOL)validateMenuItem:(NSMenuItem *)item {
+  if (item.action == @selector(open:) || item.action == @selector(reveal:) ||
+      item.action == @selector(copyPath:)) {
+    return self.table.selectedRow >= 0;
+  }
+  if (item.action == @selector(reindex)) return !self.quitting && !me_index_scanning(self.idx);
+  return YES;
+}
+
+// 右键弹出前调用：选中鼠标所在行，并直接设置菜单项可用状态
+// （新系统菜单自动校验时机不可靠，autoenablesItems=NO 后由这里全权负责）。
+- (void)prepareContextMenuForEvent:(NSEvent *)event inTable:(METableView *)table {
+  NSPoint p = [table convertPoint:event.locationInWindow fromView:nil];
+  NSInteger row = [table rowAtPoint:p];
+  if (row >= 0 && ![table isRowSelected:row]) {
+    [table selectRowIndexes:[NSIndexSet indexSetWithIndex:(NSUInteger)row] byExtendingSelection:NO];
+  }
+  NSInteger active = table.selectedRow >= 0 ? table.selectedRow : table.clickedRow;
+  BOOL hasRow = active >= 0;
+  for (NSMenuItem *it in table.menu.itemArray) {
+    if (it.action == @selector(open:) || it.action == @selector(reveal:) ||
+        it.action == @selector(copyPath:)) {
+      it.enabled = hasRow;
+    }
+  }
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender {
@@ -373,11 +558,21 @@ static OSStatus HotkeyHandler(EventHandlerCallRef next, EventRef event, void *us
 }
 
 - (BOOL)windowShouldClose:(NSWindow *)sender {
-  [sender orderOut:nil];
+  dispatch_async(dispatch_get_main_queue(), ^{
+    [sender orderOut:nil];
+  });
+  return NO;
+}
+
+- (BOOL)applicationShouldHandleReopen:(NSApplication *)sender hasVisibleWindows:(BOOL)flag {
+  (void)sender;
+  (void)flag;
+  [self showWindow];
   return NO;
 }
 
 - (void)showWindow {
+  if (NSApp.hidden) [NSApp unhide:nil];
   if (self.window.miniaturized) [self.window deminiaturize:nil];
   NSWindow *statusWin = self.status.button.window;
   if (statusWin) {
@@ -396,8 +591,35 @@ static OSStatus HotkeyHandler(EventHandlerCallRef next, EventRef event, void *us
   [NSApp activateIgnoringOtherApps:YES];
   [self.window orderFrontRegardless];
   [self.window makeKeyAndOrderFront:nil];
+  [self ensureWindowOnScreen];
+  /* frameAutosaveName 的恢复发生在窗口真正显示时甚至稍晚，可能把窗口放回已断开的
+     显示器；延迟再校一次。 */
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                 dispatch_get_main_queue(), ^{
+                   [self ensureWindowOnScreen];
+                 });
   [self.window makeFirstResponder:self.field];
   [self scheduleSearch];
+}
+
+/* 窗口落在所有屏幕之外（如外接显示器被拔掉）时，拉回主屏居中。 */
+- (void)ensureWindowOnScreen {
+  NSRect wf = self.window.frame;
+  BOOL onScreen = NO;
+  for (NSScreen *s in NSScreen.screens) {
+    if (NSIntersectsRect(wf, s.frame)) {
+      onScreen = YES;
+      break;
+    }
+  }
+  if (onScreen) return;
+  NSScreen *screen = NSScreen.mainScreen ?: NSScreen.screens.firstObject;
+  if (!screen) return;
+  NSRect vis = screen.visibleFrame;
+  CGFloat w = MIN(NSWidth(wf), NSWidth(vis));
+  CGFloat h = MIN(NSHeight(wf), NSHeight(vis));
+  NSRect r = NSMakeRect(NSMidX(vis) - w / 2.0, NSMinY(vis) + (NSHeight(vis) - h) / 2.0, w, h);
+  [self.window setFrame:r display:YES];
 }
 
 - (void)tick {
@@ -407,205 +629,16 @@ static OSStatus HotkeyHandler(EventHandlerCallRef next, EventRef event, void *us
   if (building && me_index_scanning(building)) {
     unsigned long long n = (unsigned long long)me_index_progress(building);
     self.countItem.title = [NSString stringWithFormat:@"正在索引 %llu 个名称", n];
-    self.status.button.title = [NSString stringWithFormat:@" %llu", n];
     if (self.window.isVisible && (!self.ready || self.idx != building)) {
       self.footer.stringValue = [NSString stringWithFormat:@"正在索引 %llu 个名称…", n];
     }
   } else if (me_index_scanning(idx)) {
     unsigned long long n = (unsigned long long)me_index_progress(idx);
     self.countItem.title = [NSString stringWithFormat:@"正在索引 %llu 个名称", n];
-    self.status.button.title = [NSString stringWithFormat:@" %llu", n];
     if (self.window.isVisible) self.footer.stringValue = [NSString stringWithFormat:@"正在索引 %llu 个名称…", n];
   } else if (self.ready) {
     self.countItem.title = [NSString stringWithFormat:@"已索引 %u 个名称", me_index_live(idx)];
-    self.status.button.title = @"";
   }
-  if (self.window.isVisible) {
-    uint64_t gen = me_index_generation(idx);
-    if (gen != self.seenGeneration) {
-      self.seenGeneration = gen;
-      [self scheduleSearch];
-    }
-  }
-}
-
-- (void)refreshIfVisible {
-  if (self.window.isVisible) {
-    if (self.field.stringValue.length == 0) [self scheduleSort];
-    else [self scheduleSearch];
-  }
-  [self tick];
-}
-
-- (NSUInteger)pageSize {
-  CGFloat height = self.listScroll.contentSize.height;
-  CGFloat row = self.table.rowHeight > 1 ? self.table.rowHeight : 22;
-  NSUInteger n = height > 1 ? (NSUInteger)(height / row) : 24;
-  if (n < 8) n = 8;
-  return n + 1;
-}
-
-- (void)syncScroller {
-  if (!self.showAll || self.adjustingScroller) return;
-  NSScroller *scroller = self.listScroll.verticalScroller;
-  scroller.target = self;
-  scroller.action = @selector(scrollerMoved:);
-  NSUInteger total = self.sortedCount;
-  NSUInteger page = self.rows.count;
-  self.adjustingScroller = YES;
-  if (total <= page || total == 0) {
-    scroller.knobProportion = 1;
-    scroller.doubleValue = 0;
-  } else {
-    scroller.knobProportion = MIN(1.0, (CGFloat)page / (CGFloat)total);
-    scroller.doubleValue = (CGFloat)self.windowStart / (CGFloat)(total - page);
-  }
-  self.adjustingScroller = NO;
-}
-
-- (MERow *)rowForNode:(uint32_t)node {
-  MEInfo info;
-  if (!self.idx || me_index_info(self.idx, node, &info) != 0) return nil;
-  MERow *row = [MERow new];
-  row.name = info.is_dir ? [NSString stringWithFormat:@"%@/", @(info.name)] : @(info.name);
-  row.path = @(info.path);
-  row.sizeText = info.is_dir ? @"" : FormatSize(info.size);
-  row.timeText = FormatTime(info.mtime);
-  return row;
-}
-
-- (void)fillPage {
-  NSUInteger total = self.sortedCount;
-  NSUInteger page = [self pageSize];
-  if (self.windowStart >= total) self.windowStart = 0;
-  if (total > page && self.windowStart + page > total) self.windowStart = total - page;
-  NSUInteger end = MIN(total, self.windowStart + page);
-  NSMutableArray<MERow *> *rows = [NSMutableArray arrayWithCapacity:end - self.windowStart];
-  for (NSUInteger i = self.windowStart; i < end; i++) {
-    MERow *row = [self rowForNode:self.sortedIds[i]];
-    if (row) [rows addObject:row];
-  }
-  self.rows = rows;
-  [self.table reloadData];
-  NSString *extra = self.skippedProtected ? @"  · 桌面、文稿、下载需要完全磁盘访问" : @"";
-  self.footer.stringValue = [NSString stringWithFormat:@"匹配 %lu 个%@", (unsigned long)total, extra];
-  [self syncScroller];
-}
-
-- (void)ensureSorted {
-  MEIndex *idx = self.idx;
-  if (!idx || self.sorting) return;
-  uint64_t gen = me_index_generation(idx);
-  if (self.sortedIds && self.sortedIdx == idx && self.sortedGen == gen) return;
-  self.sorting = YES;
-  dispatch_async(self.listQ, ^{
-    uint32_t live = me_index_live(idx);
-    uint32_t *ids = live ? malloc((size_t)live * sizeof(uint32_t)) : NULL;
-    uint32_t n = 0;
-    if (live && (!ids || me_index_list(idx, ids, live, &n, 1) != 0)) {
-      free(ids);
-      ids = NULL;
-      n = 0;
-    }
-    dispatch_async(dispatch_get_main_queue(), ^{
-      self.sorting = NO;
-      if (self.idx != idx) {
-        free(ids);
-        if (self.idx) [self ensureSorted];
-        return;
-      }
-      BOOL showing = self.showAll && self.sortedIds != NULL && self.field.stringValue.length == 0;
-      NSUInteger keep = self.windowStart;
-      free(self.sortedIds);
-      self.sortedIds = ids;
-      self.sortedCount = n;
-      self.sortedGen = gen;
-      self.sortedIdx = idx;
-      if (self.field.stringValue.length == 0) {
-        self.showAll = YES;
-        self.windowStart = showing ? keep : 0;
-        [self fillPage];
-      }
-      if (me_index_generation(idx) != gen) [self scheduleSort];
-    });
-  });
-}
-
-- (void)scheduleSort {
-  MEIndex *idx = self.idx;
-  if (!idx || self.sorting || self.sortAgain) return;
-  uint64_t gen = me_index_generation(idx);
-  if (self.sortedIds && self.sortedIdx == idx && self.sortedGen == gen) return;
-  if (!self.sortedIds || self.sortedIdx != idx) {
-    [self ensureSorted];
-    return;
-  }
-  self.sortAgain = YES;
-  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-    self.sortAgain = NO;
-    [self ensureSorted];
-  });
-}
-
-- (void)showAllFiles {
-  atomic_fetch_add(&g_epoch, 1);
-  self.showAll = YES;
-  MEIndex *idx = self.idx;
-  uint64_t gen = idx ? me_index_generation(idx) : 0;
-  if (!self.sortedIds || self.sortedIdx != idx) {
-    self.footer.stringValue = @"正在按名称排列…";
-    [self ensureSorted];
-    return;
-  }
-  self.windowStart = 0;
-  [self fillPage];
-  if (self.sortedGen != gen) [self scheduleSort];
-}
-
-- (void)moveWindowBy:(NSInteger)delta {
-  if (!self.showAll || self.sortedCount == 0) return;
-  NSUInteger page = [self pageSize];
-  NSUInteger maxStart = self.sortedCount > page ? self.sortedCount - page : 0;
-  NSInteger next = (NSInteger)self.windowStart + delta;
-  if (next < 0) next = 0;
-  if (next > (NSInteger)maxStart) next = (NSInteger)maxStart;
-  if ((NSUInteger)next == self.windowStart) return;
-  self.windowStart = (NSUInteger)next;
-  [self fillPage];
-}
-
-- (BOOL)handleListScroll:(NSEvent *)event {
-  if (!self.showAll || self.sortedCount <= [self pageSize]) return NO;
-  CGFloat dy = event.scrollingDeltaY;
-  NSInteger step = 0;
-  if (event.hasPreciseScrollingDeltas) step = (NSInteger)llround(-dy / self.table.rowHeight);
-  else step = dy > 0 ? -3 : 3;
-  if (step == 0) step = dy > 0 ? -1 : 1;
-  self.scrollDelta += step;
-  if (!self.scrollScheduled) {
-    self.scrollScheduled = YES;
-    dispatch_async(dispatch_get_main_queue(), ^{
-      self.scrollScheduled = NO;
-      NSInteger delta = self.scrollDelta;
-      self.scrollDelta = 0;
-      [self moveWindowBy:delta];
-    });
-  }
-  return YES;
-}
-
-- (void)scrollerMoved:(NSScroller *)scroller {
-  if (!self.showAll || self.adjustingScroller) return;
-  NSUInteger page = [self pageSize];
-  if (self.sortedCount <= page) return;
-  NSUInteger maxStart = self.sortedCount - page;
-  self.windowStart = (NSUInteger)(scroller.doubleValue * (double)maxStart);
-  [self fillPage];
-}
-
-- (void)windowDidResize:(NSNotification *)note {
-  (void)note;
-  if (self.showAll && self.field.stringValue.length == 0 && self.sortedIds) [self fillPage];
 }
 
 - (void)scheduleSearch {
@@ -613,49 +646,110 @@ static OSStatus HotkeyHandler(EventHandlerCallRef next, EventRef event, void *us
     self.footer.stringValue = me_index_scanning(self.idx) ? @"正在建立索引…" : @"正在准备索引";
     return;
   }
-  if (self.field.stringValue.length == 0) {
-    [self showAllFiles];
-    return;
-  }
-  self.showAll = NO;
   self.listScroll.verticalScroller.target = nil;
   self.listScroll.verticalScroller.action = NULL;
+  self.searchLoading = NO;
+  self.searchTotal = 0;
+  if (self.field.stringValue.length == 0) {
+    atomic_fetch_add(&g_epoch, 1);
+    free(self.resultIds);
+    self.resultIds = NULL;
+    self.resultCount = 0;
+    self.rows = [NSMutableArray array];
+    [self.table reloadData];
+    NSString *extra = self.skippedProtected ? @" · 桌面、文稿、下载需要完全磁盘访问" : @"";
+    self.footer.stringValue = [NSString stringWithFormat:@"匹配 0 个文件%@", extra];
+    return;
+  }
   uint64_t epoch = atomic_fetch_add(&g_epoch, 1) + 1;
-  NSString *query = self.field.stringValue ?: @"";
+  [self fetchSearch:self.field.stringValue epoch:epoch];
+}
+
+static const uint32_t kSearchPage = 300;
+
+/* 一次性取回按当前排序排列的全部匹配，之后从缓存分页展示。 */
+- (void)fetchSearch:(NSString *)query epoch:(uint64_t)epoch {
   MEIndex *idx = self.idx;
+  if (!idx || !query) return;
+  int key = (int)self.meSortKey;
+  int asc = self.meSortAsc ? 1 : 0;
   dispatch_async(self.searchQ, ^{
     if (atomic_load(&g_epoch) != epoch) return;
-    uint32_t ids[300];
-    uint32_t count = 0, total = 0;
+    uint32_t *ids = NULL;
+    uint32_t count = 0;
     double seconds = 0;
-    me_index_search(idx, query.UTF8String, 300, ids, &count, &total, &seconds);
-    if (atomic_load(&g_epoch) != epoch) return;
-    MEInfo *infos = count ? calloc(count, sizeof(MEInfo)) : NULL;
-    if (count) me_index_infos(idx, ids, count, infos);
-    NSMutableArray<MERow *> *rows = [NSMutableArray arrayWithCapacity:count];
-    for (uint32_t i = 0; i < count; i++) {
-      MERow *row = [MERow new];
-      row.name = infos[i].is_dir ? [NSString stringWithFormat:@"%@/", @(infos[i].name)] : @(infos[i].name);
-      row.path = @(infos[i].path);
-      row.sizeText = infos[i].is_dir ? @"" : FormatSize(infos[i].size);
-      row.timeText = FormatTime(infos[i].mtime);
-      [rows addObject:row];
-    }
-    free(infos);
+    int rc = me_index_search_sorted(idx, query.UTF8String, key, asc, &ids, &count, &seconds);
     dispatch_async(dispatch_get_main_queue(), ^{
-      if (atomic_load(&g_epoch) != epoch) return;
-      self.showAll = NO;
-      self.rows = rows;
-      [self.table reloadData];
-      if (total > count) {
-        self.footer.stringValue =
-            [NSString stringWithFormat:@"匹配 %u 个，显示前 %u 个 · %.1f ms", total, count, seconds * 1000.0];
-      } else {
-        self.footer.stringValue = [NSString stringWithFormat:@"匹配 %u 个 · %.1f ms", total, seconds * 1000.0];
+      if (atomic_load(&g_epoch) != epoch) {
+        free(ids);
+        return;
       }
-      self.seenGeneration = me_index_generation(idx);
+      if (rc != 0) {
+        self.searchLoading = NO;
+        self.footer.stringValue = [NSString stringWithFormat:@"搜索失败：%s", me_last_error()];
+        return;
+      }
+      free(self.resultIds);
+      self.resultIds = ids;
+      self.resultCount = count;
+      self.searchTotal = count;
+      self.rows = [NSMutableArray array];
+      [self loadMoreRows];
+      [self.table reloadData];
+      if (count == 0) {
+        self.footer.stringValue = @"匹配 0 个文件";
+      } else if ((uint32_t)self.rows.count < count) {
+        self.footer.stringValue = [NSString stringWithFormat:@"匹配 %u 个，已显示 %lu 个", count,
+                                                             (unsigned long)self.rows.count];
+      } else {
+        self.footer.stringValue = [NSString stringWithFormat:@"匹配 %u 个 · %.1f ms", count, seconds * 1000.0];
+      }
     });
   });
+}
+
+/* 主线程调用：从结果缓存构建下一页行。 */
+- (void)loadMoreRows {
+  if (!self.resultIds || self.rows.count >= self.resultCount) return;
+  uint32_t n = (uint32_t)MIN((NSUInteger)kSearchPage, self.resultCount - self.rows.count);
+  MEInfo *infos = calloc(n, sizeof(MEInfo));
+  if (!infos) return;
+  me_index_infos(self.idx, self.resultIds + self.rows.count, n, infos);
+  for (uint32_t i = 0; i < n; i++) {
+    MERow *row = [MERow new];
+    row.name = @(infos[i].name);
+    row.path = @(infos[i].path);
+    row.sizeText = infos[i].is_dir ? @"" : FormatSize(infos[i].size);
+    row.timeText = FormatTime(infos[i].mtime);
+    row.isDir = infos[i].is_dir != 0;
+    [self.rows addObject:row];
+  }
+  free(infos);
+}
+
+- (void)updateResultFooter {
+  if (self.rows.count < self.searchTotal) {
+    self.footer.stringValue = [NSString stringWithFormat:@"匹配 %u 个，已显示 %lu 个", self.searchTotal,
+                                                         (unsigned long)self.rows.count];
+  } else {
+    self.footer.stringValue = [NSString stringWithFormat:@"匹配 %u 个", self.searchTotal];
+  }
+}
+
+- (void)loadMoreSearchIfNeeded {
+  if (self.searchLoading || !self.ready) return;
+  if (self.searchTotal == 0 || self.rows.count >= self.searchTotal) return;
+  if (!self.resultIds) return;
+  NSClipView *clip = self.listScroll.contentView;
+  CGFloat bottom = NSMaxY(clip.bounds);
+  CGFloat height = NSHeight(self.table.bounds);
+  CGFloat row = self.table.rowHeight > 1 ? self.table.rowHeight : 22;
+  if (height > row && bottom + row * 8 < height) return;
+  NSUInteger before = self.rows.count;
+  [self loadMoreRows];
+  if (self.rows.count == before) return;
+  [self.table reloadData];
+  [self updateResultFooter];
 }
 
 - (NSInteger)numberOfRowsInTableView:(NSTableView *)tableView {
@@ -663,20 +757,186 @@ static OSStatus HotkeyHandler(EventHandlerCallRef next, EventRef event, void *us
   return (NSInteger)self.rows.count;
 }
 
-- (id)tableView:(NSTableView *)tableView objectValueForTableColumn:(NSTableColumn *)column row:(NSInteger)row {
+/* 计算文件名中需要高亮的区间，语义与搜索一致：多词 AND、!排除不参与、
+ * 大小写/音调/全半角不敏感、* ? 通配。 */
+- (NSMutableIndexSet *)highlightRangesForName:(NSString *)name {
+  NSMutableIndexSet *hits = [NSMutableIndexSet indexSet];
+  NSString *q = self.field.stringValue;
+  if (q.length == 0 || name.length == 0) return hits;
+  NSArray<NSString *> *parts =
+      [q componentsSeparatedByCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@" \t"]];
+  for (NSString *raw in parts) {
+    if (raw.length == 0) continue;
+    NSString *term = raw;
+    if ([term hasPrefix:@"!"] && term.length > 1) continue; /* 排除词不高亮 */
+    BOOL wild = [term rangeOfCharacterFromSet:[NSCharacterSet characterSetWithCharactersInString:@"*?"]]
+                    .location != NSNotFound;
+    if (wild) {
+      NSMutableString *pattern = [NSMutableString string];
+      NSMutableString *literal = [NSMutableString string];
+      for (NSUInteger i = 0; i < term.length; i++) {
+        unichar c = [term characterAtIndex:i];
+        if (c == '*' || c == '?') {
+          [pattern appendString:[NSRegularExpression escapedPatternForString:literal]];
+          [literal setString:@""];
+          [pattern appendString:(c == '*' ? @".*" : @".")];
+        } else {
+          [literal appendFormat:@"%C", c];
+        }
+      }
+      [pattern appendString:[NSRegularExpression escapedPatternForString:literal]];
+      NSError *err = nil;
+      NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:pattern
+                                                                          options:NSRegularExpressionCaseInsensitive
+                                                                            error:&err];
+      if (err) continue;
+      [re enumerateMatchesInString:name
+                           options:0
+                             range:NSMakeRange(0, name.length)
+                        usingBlock:^(NSTextCheckingResult *r, NSMatchingFlags flags, BOOL *stop) {
+                          (void)flags;
+                          (void)stop;
+                          if (r.range.location != NSNotFound) [hits addIndexesInRange:r.range];
+                        }];
+      continue;
+    }
+    NSRange search = NSMakeRange(0, name.length);
+    for (;;) {
+      NSRange hit = [name rangeOfString:term
+                                options:(NSCaseInsensitiveSearch | NSDiacriticInsensitiveSearch |
+                                         NSWidthInsensitiveSearch)
+                                  range:search];
+      if (hit.location == NSNotFound) break;
+      [hits addIndexesInRange:hit];
+      if (NSMaxRange(hit) >= name.length) break;
+      search = NSMakeRange(NSMaxRange(hit), name.length - NSMaxRange(hit));
+    }
+  }
+  return hits;
+}
+
+/* 命中部分：加粗 + 主文字色（高对比）；其余：次级文字色。深浅色模式都清晰。
+   富文本必须自带"单行尾部截断"段落样式，否则长文件名会换行。 */
+- (NSAttributedString *)highlightedName:(NSString *)name {
+  NSMutableParagraphStyle *para = [NSMutableParagraphStyle new];
+  para.lineBreakMode = NSLineBreakByTruncatingTail;
+  NSMutableAttributedString *as =
+      [[NSMutableAttributedString alloc] initWithString:name attributes:@{
+        NSFontAttributeName : [NSFont systemFontOfSize:13],
+        NSForegroundColorAttributeName : NSColor.secondaryLabelColor,
+        NSParagraphStyleAttributeName : para,
+      }];
+  NSMutableIndexSet *hits = [self highlightRangesForName:name];
+  [hits enumerateRangesInRange:NSMakeRange(0, name.length)
+                       options:0
+                    usingBlock:^(NSRange r, BOOL *stop) {
+                      (void)stop;
+                      [as addAttribute:NSFontAttributeName
+                                 value:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold]
+                                 range:r];
+                      [as addAttribute:NSForegroundColorAttributeName
+                                 value:NSColor.labelColor
+                                 range:r];
+                    }];
+  return as;
+}
+
+- (NSImage *)iconFor:(MERow *)item {
+  if (!self.iconCache) self.iconCache = [NSMutableDictionary dictionary];
+  NSString *ext = item.path.pathExtension.lowercaseString;
+  NSString *key = item.isDir ? @"__dir" : (ext.length ? ext : @"__file");
+  NSImage *img = self.iconCache[key];
+  if (img) return img;
+  UTType *type = nil;
+  if (!item.isDir && ext.length) type = [UTType typeWithFilenameExtension:ext];
+  if (!type) type = [UTType typeWithIdentifier:item.isDir ? @"public.folder" : @"public.data"];
+  if (!type) type = [UTType typeWithIdentifier:@"public.item"];
+  img = [NSWorkspace.sharedWorkspace iconForContentType:type];
+  img.size = NSMakeSize(16, 16);
+  self.iconCache[key] = img;
+  return img;
+}
+
+- (NSView *)tableView:(NSTableView *)tableView viewForTableColumn:(NSTableColumn *)column row:(NSInteger)row {
   (void)tableView;
-  if (row < 0 || (NSUInteger)row >= self.rows.count) return @"";
+  if (row < 0 || (NSUInteger)row >= self.rows.count) return nil;
   MERow *item = self.rows[(NSUInteger)row];
   NSString *ident = column.identifier;
-  if ([ident isEqualToString:@"name"]) return item.name;
-  if ([ident isEqualToString:@"path"]) return item.path;
-  if ([ident isEqualToString:@"size"]) return item.sizeText;
-  return item.timeText;
+  NSTableCellView *cell = [tableView makeViewWithIdentifier:ident owner:self];
+  if (!cell) {
+    cell = [[NSTableCellView alloc] initWithFrame:NSZeroRect];
+    cell.identifier = ident;
+    BOOL isName = [ident isEqualToString:@"name"];
+    NSTextField *tf = [NSTextField labelWithString:@""];
+    tf.tag = 1;
+    tf.translatesAutoresizingMaskIntoConstraints = NO;
+    tf.lineBreakMode = [ident isEqualToString:@"path"] ? NSLineBreakByTruncatingMiddle
+                                                       : NSLineBreakByTruncatingTail;
+    [cell addSubview:tf];
+    if (isName) {
+      tf.maximumNumberOfLines = 1;
+      tf.cell.wraps = NO;
+      NSImageView *iv = [NSImageView new];
+      iv.tag = 2;
+      iv.translatesAutoresizingMaskIntoConstraints = NO;
+      [cell addSubview:iv];
+      [NSLayoutConstraint activateConstraints:@[
+        [iv.leadingAnchor constraintEqualToAnchor:cell.leadingAnchor constant:2],
+        [iv.widthAnchor constraintEqualToAnchor:cell.heightAnchor],
+        [iv.centerYAnchor constraintEqualToAnchor:cell.centerYAnchor],
+        [tf.leadingAnchor constraintEqualToAnchor:iv.trailingAnchor constant:6],
+      ]];
+    } else {
+      [NSLayoutConstraint activateConstraints:@[
+        [tf.leadingAnchor constraintEqualToAnchor:cell.leadingAnchor constant:4],
+      ]];
+    }
+    [NSLayoutConstraint activateConstraints:@[
+      [tf.trailingAnchor constraintEqualToAnchor:cell.trailingAnchor constant:-4],
+      [tf.centerYAnchor constraintEqualToAnchor:cell.centerYAnchor],
+    ]];
+  }
+  NSTextField *tf = [cell viewWithTag:1];
+  NSImageView *iv = [cell viewWithTag:2];
+  if ([ident isEqualToString:@"name"]) {
+    tf.attributedStringValue = [self highlightedName:item.name];
+    iv.image = [self iconFor:item];
+  } else if ([ident isEqualToString:@"path"]) {
+    tf.stringValue = item.path;
+    tf.textColor = NSColor.secondaryLabelColor;
+  } else if ([ident isEqualToString:@"size"]) {
+    tf.stringValue = item.sizeText;
+    tf.textColor = NSColor.secondaryLabelColor;
+  } else {
+    tf.stringValue = item.timeText;
+    tf.textColor = NSColor.secondaryLabelColor;
+  }
+  cell.toolTip = item.path;
+  return cell;
+}
+
+- (void)tableView:(NSTableView *)tableView sortDescriptorsDidChange:(NSArray<NSSortDescriptor *> *)oldDescriptors {
+  (void)oldDescriptors;
+  NSSortDescriptor *d = tableView.sortDescriptors.firstObject;
+  if (!d) return;
+  NSInteger key = ME_SORT_NAME;
+  if ([d.key isEqualToString:@"path"]) key = ME_SORT_PATH;
+  else if ([d.key isEqualToString:@"size"]) key = ME_SORT_SIZE;
+  else if ([d.key isEqualToString:@"mtime"]) key = ME_SORT_MTIME;
+  self.meSortKey = key;
+  self.meSortAsc = d.ascending;
+  self.searchLoading = NO;
+  [self scheduleSearch];
 }
 
 - (void)open:(id)sender {
   (void)sender;
   [self revealOrOpen:NO];
+}
+
+- (void)reveal:(id)sender {
+  (void)sender;
+  [self revealOrOpen:YES];
 }
 
 - (void)revealOrOpen:(BOOL)reveal {
@@ -687,14 +947,17 @@ static OSStatus HotkeyHandler(EventHandlerCallRef next, EventRef event, void *us
   NSURL *url = [NSURL fileURLWithPath:path];
   if (reveal) [NSWorkspace.sharedWorkspace activateFileViewerSelectingURLs:@[url]];
   else [NSWorkspace.sharedWorkspace openURL:url];
+  /* 不主动压窗：目标应用激活后自然盖在本窗口上面，本窗口保持可见 */
 }
 
 - (BOOL)control:(NSControl *)control textView:(NSTextView *)textView doCommandBySelector:(SEL)command {
   (void)control;
   (void)textView;
   if (command == @selector(insertNewline:)) {
-    BOOL reveal = (NSApp.currentEvent.modifierFlags & NSEventModifierFlagCommand) != 0;
-    [self revealOrOpen:reveal];
+    // 回车不再打开文件；⌘回车在 Finder 中显示
+    if ((NSApp.currentEvent.modifierFlags & NSEventModifierFlagCommand) != 0) {
+      [self revealOrOpen:YES];
+    }
     return YES;
   }
   if (command == @selector(cancelOperation:)) {
@@ -706,20 +969,9 @@ static OSStatus HotkeyHandler(EventHandlerCallRef next, EventRef event, void *us
     if (nrows == 0) return YES;
     NSInteger row = self.table.selectedRow;
     if (command == @selector(moveDown:)) {
-      if (row >= 0 && (NSUInteger)row + 1 >= nrows && self.showAll) {
-        [self moveWindowBy:1];
-        if (self.rows.count > 0) {
-          [self.table selectRowIndexes:[NSIndexSet indexSetWithIndex:self.rows.count - 1] byExtendingSelection:NO];
-        }
-        return YES;
-      }
+      if (row >= 0 && (NSUInteger)row + 1 >= nrows) [self loadMoreSearchIfNeeded];
       row = row < 0 ? 0 : MIN(row + 1, (NSInteger)nrows - 1);
     } else {
-      if (row <= 0 && self.showAll) {
-        [self moveWindowBy:-1];
-        [self.table selectRowIndexes:[NSIndexSet indexSetWithIndex:0] byExtendingSelection:NO];
-        return YES;
-      }
       row = row <= 0 ? 0 : row - 1;
     }
     [self.table selectRowIndexes:[NSIndexSet indexSetWithIndex:(NSUInteger)row] byExtendingSelection:NO];
@@ -740,14 +992,13 @@ static OSStatus HotkeyHandler(EventHandlerCallRef next, EventRef event, void *us
 }
 
 - (void)reindex {
-  if (!self.rootPath.length) return;
+  if (!self.rootPath.length || self.building || me_index_scanning(self.idx)) return;
   self.ready = NO;
   NSString *root = self.rootPath;
   NSString *indexPath = self.indexPath;
   MEIndex *old = self.idx;
   self.idx = NULL;
   dispatch_async(self.searchQ, ^{
-    dispatch_sync(self.listQ, ^{});
     if (old) me_index_free(old);
     MEIndex *fresh = me_index_create();
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -939,8 +1190,25 @@ static NSString *CurrentVersion(void) {
 }
 
 - (void)quit {
-  [self saveIndex];
-  [NSApp terminate:nil];
+  if (self.quitting) return;
+  self.quitting = YES;
+  MEIndex *idx = self.idx;
+  MEIndex *building = self.building;
+  NSString *path = self.indexPath;
+  BOOL skip = self.skipSave || path.length == 0;
+  dispatch_async(self.saveQ, ^{
+    if (!skip) {
+      if (building && me_index_scanning(building) && (!idx || idx == building || !me_index_complete(idx))) {
+        me_index_save(building, path.UTF8String);
+      } else if (idx) {
+        me_index_save(idx, path.UTF8String);
+      }
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+      self.skipSave = YES;
+      [NSApp terminate:nil];
+    });
+  });
 }
 
 - (void)saveIndex {
@@ -960,8 +1228,8 @@ static NSString *CurrentVersion(void) {
 - (void)applicationWillTerminate:(NSNotification *)note {
   (void)note;
   if (!self.skipSave) [self saveIndex];
-  free(self.sortedIds);
-  self.sortedIds = NULL;
+  free(self.resultIds);
+  self.resultIds = NULL;
   if (self.idx) {
     me_index_free(self.idx);
     self.idx = NULL;
@@ -999,13 +1267,21 @@ static int Smoke(void) {
 }
 
 @implementation MEScrollView
-- (void)scrollWheel:(NSEvent *)event {
-  if (self.owner && [self.owner handleListScroll:event]) return;
-  [super scrollWheel:event];
-}
 - (void)reflectScrolledClipView:(NSClipView *)clipView {
   [super reflectScrolledClipView:clipView];
-  [self.owner syncScroller];
+  [self.owner loadMoreSearchIfNeeded];
+}
+@end
+
+@implementation METableView
+- (void)copy:(id)sender {
+  if (self.owner) [self.owner copyPath:sender];
+}
+/* 右键弹出菜单前，先选中鼠标所在行并同步菜单项可用状态。
+   NSTableView 右键不保证改变选中行，且新系统的菜单校验时机不可靠。 */
+- (NSMenu *)menuForEvent:(NSEvent *)event {
+  if (self.owner) [self.owner prepareContextMenuForEvent:event inTable:self];
+  return [super menuForEvent:event];
 }
 @end
 

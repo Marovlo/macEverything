@@ -61,7 +61,7 @@ struct MEIndex {
   int writable;
   int dirty;
   int eid_dirty;
-  int complete;
+  atomic_int complete;
   int fd;
   void *map;
   size_t map_len;

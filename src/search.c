@@ -276,16 +276,8 @@ int me_index_list(MEIndex *idx, uint32_t *out, uint32_t cap, uint32_t *out_count
   return 0;
 }
 
-int me_index_search(MEIndex *idx, const char *query, uint32_t limit, uint32_t *out,
-                    uint32_t *out_count, uint32_t *out_total, double *seconds) {
-  if (!idx || !out_count || !out_total) return -1;
-  double t0 = me_now();
-  *out_count = 0;
-  *out_total = 0;
-  if (limit && !out) return -1;
-
-  char storage[8][1024];
-  Term terms[8];
+/* 解析查询词，与搜索语义一致：空格分词，!前缀排除，* ? 通配。storage 由调用方提供。 */
+static int parse_terms(const char *query, char storage[8][1024], Term terms[8]) {
   int nterms = 0;
   const char *q = query ? query : "";
   while (*q && nterms < 8) {
@@ -324,6 +316,22 @@ int me_index_search(MEIndex *idx, const char *query, uint32_t limit, uint32_t *o
     }
     terms[j] = key;
   }
+  return nterms;
+}
+
+int me_index_search_range(MEIndex *idx, const char *query, uint32_t offset, uint32_t limit,
+                          uint32_t *out, uint32_t *out_count, uint32_t *out_total, double *seconds) {
+  if (!idx || !out_count || !out_total) return -1;
+  double t0 = me_now();
+  *out_count = 0;
+  *out_total = 0;
+  if (limit && !out) return -1;
+  if (limit && offset > UINT32_MAX - limit) return -1;
+  uint32_t need = offset + limit;
+
+  char storage[8][1024];
+  Term terms[8];
+  int nterms = parse_terms(query, storage, terms);
 
   int prefix_i = -1;
   for (int t = 0; t < nterms; t++) {
@@ -344,22 +352,25 @@ int me_index_search(MEIndex *idx, const char *query, uint32_t limit, uint32_t *o
   uint32_t *pref = stack_pref;
   uint32_t *rest = stack_rest;
   uint32_t *heap = NULL;
-  int ranked = prefix_i >= 0 && limit > 0;
-  if (ranked && limit > 256) {
-    heap = malloc((size_t)limit * 2 * sizeof(uint32_t));
+  int ranked = prefix_i >= 0 && need > 0;
+  if (ranked && need > 256) {
+    heap = malloc((size_t)need * 2 * sizeof(uint32_t));
     if (!heap) ranked = 0;
     else {
       pref = heap;
-      rest = heap + limit;
+      rest = heap + need;
     }
   }
 #define TAKE(id, is_prefix)                                                                          \
   do {                                                                                               \
     if (!ranked) {                                                                                   \
-      if (filled < limit) out[filled++] = (id);                                                      \
+      if (filled < need) {                                                                           \
+        if (filled >= offset) out[filled - offset] = (id);                                           \
+        filled++;                                                                                    \
+      }                                                                                              \
     } else if (is_prefix) {                                                                          \
-      if (np < limit) pref[np++] = (id);                                                             \
-    } else if (nr < limit) {                                                                         \
+      if (np < need) pref[np++] = (id);                                                              \
+    } else if (nr < need) {                                                                          \
       rest[nr++] = (id);                                                                             \
     }                                                                                                \
     total++;                                                                                         \
@@ -367,9 +378,10 @@ int me_index_search(MEIndex *idx, const char *query, uint32_t limit, uint32_t *o
 
   if (nterms == 0) {
     uint32_t live = idx->live;
-    for (uint32_t i = 0; i < count && filled < limit; i++) {
+    for (uint32_t i = 0; i < count && filled < need; i++) {
       if (keys[i].flags & ME_F_DEAD) continue;
-      out[filled++] = i;
+      if (filled >= offset) out[filled - offset] = i;
+      filled++;
     }
     total = live;
   } else if (nterms == 1 && !terms[0].exclude && !terms[0].wild && terms[0].len == 1) {
@@ -409,15 +421,181 @@ int me_index_search(MEIndex *idx, const char *query, uint32_t limit, uint32_t *o
 #undef TAKE
 
   if (ranked) {
+    uint32_t seen = 0;
     filled = 0;
-    for (uint32_t i = 0; i < np && filled < limit; i++) out[filled++] = pref[i];
-    for (uint32_t i = 0; i < nr && filled < limit; i++) out[filled++] = rest[i];
+    for (uint32_t i = 0; i < np; i++) {
+      if (seen >= offset && filled < limit) out[filled++] = pref[i];
+      seen++;
+    }
+    for (uint32_t i = 0; i < nr; i++) {
+      if (seen >= offset && filled < limit) out[filled++] = rest[i];
+      seen++;
+    }
+  } else if (filled > offset) {
+    filled -= offset;
+    if (filled > limit) filled = limit;
+  } else {
+    filled = 0;
   }
   free(heap);
 
   pthread_rwlock_unlock(&idx->lock);
   *out_count = filled;
   *out_total = total;
+  if (seconds) *seconds = me_now() - t0;
+  return 0;
+}
+
+int me_index_search(MEIndex *idx, const char *query, uint32_t limit, uint32_t *out,
+                    uint32_t *out_count, uint32_t *out_total, double *seconds) {
+  return me_index_search_range(idx, query, 0, limit, out, out_count, out_total, seconds);
+}
+
+/* 排序期间持有读锁，比较器可以直接读取 blob/keys。 */
+static const MEIndex *g_sort_idx;
+
+typedef struct MatchRef {
+  uint32_t id;
+  uint64_t size;
+  int64_t mtime;
+  uint32_t flags;
+  char *path; /* 仅路径排序时使用 */
+} MatchRef;
+
+static int cmp_ref_name(void *thunk, const void *a, const void *b) {
+  (void)thunk;
+  const MatchRef *ra = a, *rb = b;
+  const MEIndex *idx = g_sort_idx;
+  const MEKey *ka = &idx->keys[ra->id], *kb = &idx->keys[rb->id];
+  size_t n = ka->len < kb->len ? ka->len : kb->len;
+  int c = n ? memcmp(idx->blob + ka->off, idx->blob + kb->off, n) : 0;
+  if (c != 0) return c;
+  if (ka->len != kb->len) return ka->len < kb->len ? -1 : 1;
+  return ra->id < rb->id ? -1 : ra->id > rb->id;
+}
+
+static int cmp_ref_path(void *thunk, const void *a, const void *b) {
+  (void)thunk;
+  const MatchRef *ra = a, *rb = b;
+  int c = strcmp(ra->path, rb->path);
+  if (c != 0) return c;
+  return ra->id < rb->id ? -1 : ra->id > rb->id;
+}
+
+static int cmp_ref_size(void *thunk, const void *a, const void *b) {
+  const MatchRef *ra = a, *rb = b;
+  /* 文件夹始终排在文件后面（升序、降序都一样）。 */
+  int da = (ra->flags & ME_F_DIR) ? 1 : 0;
+  int db = (rb->flags & ME_F_DIR) ? 1 : 0;
+  if (da != db) return da - db;
+  if (ra->size != rb->size) {
+    int asc = *(const int *)thunk;
+    return asc ? (ra->size < rb->size ? -1 : 1) : (ra->size > rb->size ? -1 : 1);
+  }
+  return ra->id < rb->id ? -1 : ra->id > rb->id;
+}
+
+static int cmp_ref_mtime(void *thunk, const void *a, const void *b) {
+  const MatchRef *ra = a, *rb = b;
+  if (ra->mtime != rb->mtime) {
+    int asc = *(const int *)thunk;
+    return asc ? (ra->mtime < rb->mtime ? -1 : 1) : (ra->mtime > rb->mtime ? -1 : 1);
+  }
+  return ra->id < rb->id ? -1 : ra->id > rb->id;
+}
+
+int me_index_search_sorted(MEIndex *idx, const char *query, int key, int ascending,
+                           uint32_t **out_ids, uint32_t *out_count, double *seconds) {
+  if (!idx || !out_ids || !out_count) return -1;
+  double t0 = me_now();
+  *out_ids = NULL;
+  *out_count = 0;
+
+  char storage[8][1024];
+  Term terms[8];
+  int nterms = parse_terms(query, storage, terms);
+
+  pthread_rwlock_rdlock(&idx->lock);
+  const MEKey *keys = idx->keys;
+  const char *blob = idx->blob;
+  uint32_t count = idx->count;
+
+  uint32_t cap = 1024, n = 0;
+  MatchRef *refs = malloc(cap * sizeof(MatchRef));
+  if (!refs) {
+    pthread_rwlock_unlock(&idx->lock);
+    me_set_error("out of memory");
+    return -1;
+  }
+  for (uint32_t i = 0; i < count; i++) {
+    if (keys[i].flags & ME_F_DEAD) continue;
+    const char *s = blob + keys[i].off;
+    size_t sl = keys[i].len;
+    int ok = 1;
+    for (int t = 0; t < nterms; t++) {
+      int hit = terms[t].wild ? glob_match(s, sl, terms[t].s, terms[t].len)
+                              : me_contains(s, sl, terms[t].s, terms[t].len);
+      if (terms[t].exclude ? hit : !hit) {
+        ok = 0;
+        break;
+      }
+    }
+    if (!ok) continue;
+    if (n == cap) {
+      uint32_t ncap = cap * 2;
+      MatchRef *nr = realloc(refs, (size_t)ncap * sizeof(MatchRef));
+      if (!nr) break;
+      refs = nr;
+      cap = ncap;
+    }
+    refs[n].id = i;
+    refs[n].size = idx->nodes[i].size;
+    refs[n].mtime = idx->nodes[i].mtime;
+    refs[n].flags = keys[i].flags;
+    refs[n].path = NULL;
+    n++;
+  }
+
+  int asc = ascending ? 1 : 0;
+  if (key == ME_SORT_PATH) {
+    for (uint32_t i = 0; i < n; i++) {
+      char p[4096];
+      refs[i].path = me_build_path_ul(idx, refs[i].id, p, sizeof p) == 0 ? strdup(p) : NULL;
+    }
+  }
+  g_sort_idx = idx;
+  if (key == ME_SORT_NAME) {
+    qsort_r(refs, n, sizeof(MatchRef), &asc, cmp_ref_name);
+  } else if (key == ME_SORT_PATH) {
+    qsort_r(refs, n, sizeof(MatchRef), &asc, cmp_ref_path);
+  } else if (key == ME_SORT_SIZE) {
+    qsort_r(refs, n, sizeof(MatchRef), &asc, cmp_ref_size);
+  } else if (key == ME_SORT_MTIME) {
+    qsort_r(refs, n, sizeof(MatchRef), &asc, cmp_ref_mtime);
+  }
+  if (!asc && (key == ME_SORT_NAME || key == ME_SORT_PATH)) {
+    for (uint32_t i = 0; i < n / 2; i++) {
+      MatchRef tmp = refs[i];
+      refs[i] = refs[n - 1 - i];
+      refs[n - 1 - i] = tmp;
+    }
+  }
+
+  uint32_t *ids = malloc((size_t)(n ? n : 1) * sizeof(uint32_t));
+  if (!ids) {
+    for (uint32_t i = 0; i < n; i++) free(refs[i].path);
+    free(refs);
+    pthread_rwlock_unlock(&idx->lock);
+    me_set_error("out of memory");
+    return -1;
+  }
+  for (uint32_t i = 0; i < n; i++) ids[i] = refs[i].id;
+  for (uint32_t i = 0; i < n; i++) free(refs[i].path);
+  free(refs);
+  pthread_rwlock_unlock(&idx->lock);
+
+  *out_ids = ids;
+  *out_count = n;
   if (seconds) *seconds = me_now() - t0;
   return 0;
 }

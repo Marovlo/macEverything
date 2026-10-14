@@ -5,19 +5,21 @@
   <key>CFBundleExecutable</key>
   <string>MacEverything</string>
   <key>CFBundleIdentifier</key>
-  <string>local.maceverything</string>
+  <string>com.marovlo.macEverything</string>
   <key>CFBundleIconFile</key>
   <string>AppIcon</string>
   <key>CFBundleName</key>
   <string>MacEverything</string>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>zh_CN</string>
   <key>CFBundleDisplayName</key>
   <string>MacEverything</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>1.0.0</string>
+  <string>1.1.0</string>
   <key>CFBundleVersion</key>
-  <string>1</string>
+  <string>1.1.0</string>
   <key>LSMinimumSystemVersion</key>
   <string>12.0</string>
   <key>LSUIElement</key>

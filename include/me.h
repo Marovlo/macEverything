@@ -62,6 +62,24 @@ uint32_t me_index_add_child(MEIndex *idx, uint32_t parent, const char *name,
 int me_index_search(MEIndex *idx, const char *query, uint32_t limit,
                     uint32_t *out, uint32_t *out_count, uint32_t *out_total,
                     double *seconds);
+/* Same order as me_index_search, starting at offset. out receives at most limit ids. */
+int me_index_search_range(MEIndex *idx, const char *query, uint32_t offset, uint32_t limit,
+                          uint32_t *out, uint32_t *out_count, uint32_t *out_total,
+                          double *seconds);
+
+/* Sort keys for me_index_search_sorted. */
+enum {
+  ME_SORT_NAME = 0,
+  ME_SORT_PATH = 1,
+  ME_SORT_SIZE = 2,
+  ME_SORT_MTIME = 3,
+};
+
+/* All matches, sorted by key. Ascending unless ascending == 0.
+ * Size sort keeps folders after files in both directions.
+ * The caller frees *out_ids. */
+int me_index_search_sorted(MEIndex *idx, const char *query, int key, int ascending,
+                           uint32_t **out_ids, uint32_t *out_count, double *seconds);
 /* Live node ids. sort_by_name orders by the folded filename. */
 int me_index_list(MEIndex *idx, uint32_t *out, uint32_t cap, uint32_t *out_count,
                   int sort_by_name);

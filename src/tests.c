@@ -362,6 +362,107 @@ static void test_concurrent_search(void) {
   CHECK(system(cmd) == 0);
 }
 
+static void test_search_pagination(void) {
+  MEIndex *idx = me_index_create();
+  uint32_t root = me_index_add_root(idx, "/tmp/bench");
+  CHECK(root != ME_NONE);
+  const uint32_t N = 1000;
+  for (uint32_t i = 0; i < N; i++) {
+    char name[32];
+    snprintf(name, sizeof name, "page-%05u.log", i);
+    CHECK(me_index_add_child(idx, root, name, i, 1, 1, 0) != ME_NONE);
+  }
+  /* 分页拼起来必须等于全量顺序，total 各页一致。 */
+  uint32_t seen = 0;
+  uint32_t expect_total = 0;
+  {
+    uint32_t id = 0, count = 0, total = 0;
+    me_index_search(idx, "page-", 1, &id, &count, &total, NULL);
+    expect_total = total;
+  }
+  CHECK(expect_total == N);
+  while (seen < N) {
+    uint32_t ids[300];
+    uint32_t count = 0, total = 0;
+    CHECK(me_index_search_range(idx, "page-", seen, 300, ids, &count, &total, NULL) == 0);
+    CHECK(total == expect_total);
+    for (uint32_t i = 0; i < count; i++) {
+      char name[32];
+      snprintf(name, sizeof name, "page-%05u.log", seen + i);
+      MEInfo info;
+      CHECK(me_index_info(idx, ids[i], &info) == 0);
+      CHECK(strcmp(info.name, name) == 0);
+    }
+    seen += count;
+    if (count == 0) break;
+  }
+  CHECK(seen == N);
+  me_index_free(idx);
+}
+
+static void test_search_sorted(void) {
+  MEIndex *idx = me_index_create();
+  uint32_t root = me_index_add_root(idx, "/tmp/bench");
+  CHECK(root != ME_NONE);
+  CHECK(me_index_add_child(idx, root, "b.txt", 1, 300, 500, 0) != ME_NONE);
+  CHECK(me_index_add_child(idx, root, "a.txt", 2, 100, 900, 0) != ME_NONE);
+  CHECK(me_index_add_child(idx, root, "sub", 3, 0, 100, ME_F_DIR) != ME_NONE);
+  CHECK(me_index_add_child(idx, root, "c.txt", 4, 200, 700, 0) != ME_NONE);
+
+  uint32_t *ids = NULL;
+  uint32_t count = 0;
+  CHECK(me_index_search_sorted(idx, ".txt", ME_SORT_NAME, 1, &ids, &count, NULL) == 0);
+  CHECK(count == 3);
+  MEInfo info;
+  me_index_info(idx, ids[0], &info);
+  CHECK(strcmp(info.name, "a.txt") == 0);
+  me_index_info(idx, ids[1], &info);
+  CHECK(strcmp(info.name, "b.txt") == 0);
+  me_index_info(idx, ids[2], &info);
+  CHECK(strcmp(info.name, "c.txt") == 0);
+  free(ids);
+
+  CHECK(me_index_search_sorted(idx, ".txt", ME_SORT_NAME, 0, &ids, &count, NULL) == 0);
+  me_index_info(idx, ids[0], &info);
+  CHECK(strcmp(info.name, "c.txt") == 0);
+  free(ids);
+
+  /* 大小排序：文件夹置底，文件按大小升序。空查询匹配 4 个子项 + 根节点（也是目录）。 */
+  CHECK(me_index_search_sorted(idx, "", ME_SORT_SIZE, 1, &ids, &count, NULL) == 0);
+  CHECK(count == 5);
+  me_index_info(idx, ids[0], &info);
+  CHECK(strcmp(info.name, "a.txt") == 0);
+  me_index_info(idx, ids[1], &info);
+  CHECK(strcmp(info.name, "c.txt") == 0);
+  me_index_info(idx, ids[2], &info);
+  CHECK(strcmp(info.name, "b.txt") == 0);
+  me_index_info(idx, ids[3], &info);
+  CHECK(info.is_dir == 1);
+  me_index_info(idx, ids[4], &info);
+  CHECK(info.is_dir == 1);
+  free(ids);
+  CHECK(me_index_search_sorted(idx, "", ME_SORT_SIZE, 0, &ids, &count, NULL) == 0);
+  me_index_info(idx, ids[0], &info);
+  CHECK(strcmp(info.name, "b.txt") == 0);
+  me_index_info(idx, ids[4], &info);
+  CHECK(info.is_dir == 1);
+  free(ids);
+
+  /* 修改时间降序：最新的在前 */
+  CHECK(me_index_search_sorted(idx, "", ME_SORT_MTIME, 0, &ids, &count, NULL) == 0);
+  me_index_info(idx, ids[0], &info);
+  CHECK(strcmp(info.name, "a.txt") == 0);
+  free(ids);
+
+  /* 路径排序 */
+  CHECK(me_index_search_sorted(idx, ".txt", ME_SORT_PATH, 1, &ids, &count, NULL) == 0);
+  me_index_info(idx, ids[0], &info);
+  CHECK(strcmp(info.path, "/tmp/bench/a.txt") == 0);
+  free(ids);
+
+  me_index_free(idx);
+}
+
 static void test_prefix_rank(void) {
   MEIndex *idx = me_index_create();
   uint32_t root = me_index_add_root(idx, "/tmp/bench");
@@ -408,6 +509,8 @@ int main(void) {
   test_query_semantics();
   test_prefix_rank();
   test_list_sorted();
+  test_search_pagination();
+  test_search_sorted();
   test_scan_tree();
   test_watch();
   test_concurrent_search();

@@ -690,14 +690,6 @@ static int reconcile_dir(MEIndex *idx, const char *path) {
   }
 
   pthread_rwlock_wrlock(&idx->lock);
-  uint32_t child_count = 0;
-  for (uint32_t c = idx->nodes[node].first_child; c != ME_NONE; c = idx->nodes[c].next_sibling) child_count++;
-  uint32_t *children = malloc((child_count ? child_count : 1) * sizeof(uint32_t));
-  uint32_t nc = 0;
-  if (children) {
-    for (uint32_t c = idx->nodes[node].first_child; c != ME_NONE; c = idx->nodes[c].next_sibling)
-      children[nc++] = c;
-  }
   char parent_base[768];
   uint16_t parent_len = idx->nodes[node].name_len;
   if (parent_len >= sizeof parent_base) parent_len = sizeof parent_base - 1;
@@ -738,46 +730,40 @@ static int reconcile_dir(MEIndex *idx, const char *path) {
       recs[nrec++].path = cp;
     }
   }
-  if (children) {
-    for (uint32_t i = 0; i < nc; i++) {
-      uint32_t c = children[i];
-      if (c >= idx->count) continue;
-      if (idx->keys[c].flags & ME_F_DEAD) continue;
-      const MEKey *k = &idx->keys[c];
-      uint64_t h = name_hash(idx->blob + k->off, k->len);
-      if (!name_in_set(set, set_cap, h)) {
-        /* declare kill via refresh absence: mark using lookup-less path.
-           kill_tree is static. Use forget by building path after unlock? */
-      }
+  /* 磁盘上已消失的子项：在同一把写锁内构建路径（避免节点 id 被
+     并发 compact 重映射后误删其他条目），解锁后按路径 forget。 */
+  char **dead = NULL;
+  uint32_t ndead = 0, deadcap = 0;
+  for (uint32_t c = idx->nodes[node].first_child; c != ME_NONE; c = idx->nodes[c].next_sibling) {
+    if (idx->keys[c].flags & ME_F_DEAD) continue;
+    const MEKey *k = &idx->keys[c];
+    uint64_t h = name_hash(idx->blob + k->off, k->len);
+    if (name_in_set(set, set_cap, h)) continue;
+    char child_path[4096];
+    if (me_build_path_ul(idx, c, child_path, sizeof child_path) != 0) continue;
+    if (ndead == deadcap) {
+      uint32_t cap = deadcap ? deadcap * 2 : 8;
+      char **nd = realloc(dead, cap * sizeof(char *));
+      if (!nd) continue;
+      dead = nd;
+      deadcap = cap;
     }
+    dead[ndead] = strdup(child_path);
+    if (dead[ndead]) ndead++;
   }
   pthread_rwlock_unlock(&idx->lock);
 
-  /* Second pass deletes are handled below with forget, which locks itself.
-     Rebuild the missing set from children snapshot + keys. */
-  if (children) {
-    pthread_rwlock_rdlock(&idx->lock);
-    for (uint32_t i = 0; i < nc; i++) {
-      uint32_t c = children[i];
-      if (c >= idx->count || (idx->keys[c].flags & ME_F_DEAD)) continue;
-      const MEKey *k = &idx->keys[c];
-      uint64_t h = name_hash(idx->blob + k->off, k->len);
-      if (name_in_set(set, set_cap, h)) continue;
-      char child_path[4096];
-      if (me_build_path_ul(idx, c, child_path, sizeof child_path) != 0) continue;
-      pthread_rwlock_unlock(&idx->lock);
-      me_index_forget_path(idx, child_path);
-      pthread_rwlock_rdlock(&idx->lock);
-    }
-    pthread_rwlock_unlock(&idx->lock);
+  for (uint32_t i = 0; i < ndead; i++) {
+    me_index_forget_path(idx, dead[i]);
+    free(dead[i]);
   }
+  free(dead);
 
   for (uint32_t i = 0; i < nrec; i++) {
     rescan_dir(idx, recs[i].path);
     free(recs[i].path);
   }
   free(recs);
-  free(children);
   free(set);
   free(folds);
   free(fold_off);
