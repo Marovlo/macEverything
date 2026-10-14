@@ -2,6 +2,8 @@
 #import <Carbon/Carbon.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
+#include <fcntl.h>
+
 #include "me.h"
 
 #include <spawn.h>
@@ -141,31 +143,37 @@ static void OnIndexChange(void *ctx) {
   [self finishLaunch];
 }
 
-/* 探测桌面目录是否被 TCC 拦截（拒绝时 openat 会阻塞，须在后台线程探测）。 */
-- (BOOL)fdaLikelyDenied {
+/* 阻塞式探测（须在后台线程调用）。open 桌面目录：TCC 拒绝时会一直阻塞，
+   与扫描器 scan.c 的探测方式一致；API 层的目录列举会静默返回空结果，不可靠。 */
+- (BOOL)fdaProbeGrantedBlocking {
   NSString *desktop = [NSHomeDirectory() stringByAppendingPathComponent:@"Desktop"];
+  int fd = open(desktop.fileSystemRepresentation, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (fd >= 0) {
+    close(fd);
+    return YES;
+  }
+  return NO;
+}
+
+/* 带超时的探测：0.4s 内打不开视为被 TCC 拦截。须在后台线程调用。 */
+- (BOOL)fdaLikelyDenied {
   dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-  __block BOOL denied = NO;
+  __block BOOL granted = NO;
   dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-    NSError *err = nil;
-    [NSFileManager.defaultManager contentsOfDirectoryAtPath:desktop error:&err];
-    denied = err != nil;
+    granted = [self fdaProbeGrantedBlocking];
     dispatch_semaphore_signal(sem);
   });
   BOOL got = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW,
                                                         (int64_t)(0.4 * NSEC_PER_SEC))) == 0;
-  return got ? denied : YES; /* 超时未返回 = 被 TCC 挡住 */
+  return got ? !granted : YES; /* 超时未返回 = 被 TCC 挡住 */
 }
 
-/* 异步刷新授权状态缓存（被拒时后台探测会阻塞，in-flight 防止堆积）。 */
+/* 异步刷新授权状态缓存（被拒时探测会一直阻塞，in-flight 防止线程堆积）。 */
 - (void)refreshFDAStateAsync {
   if (self.fdaCheckInFlight) return;
   self.fdaCheckInFlight = YES;
-  NSString *desktop = [NSHomeDirectory() stringByAppendingPathComponent:@"Desktop"];
   dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-    NSError *err = nil;
-    [NSFileManager.defaultManager contentsOfDirectoryAtPath:desktop error:&err];
-    BOOL granted = err == nil;
+    BOOL granted = [self fdaProbeGrantedBlocking]; /* 被拒时会阻塞挂起，属预期 */
     dispatch_async(dispatch_get_main_queue(), ^{
       self.fdaCheckInFlight = NO;
       if (granted != self.fdaGrantedCached || !self.fdaStateKnown) {
