@@ -25,6 +25,7 @@ static _Atomic uint64_t g_epoch = 0;
 @property(copy) NSString *term;
 @property NSUInteger termCount;
 @property NSInteger indent;
+@property BOOL pinned; /* 已固定到首页 */
 @end
 
 @implementation MERow
@@ -260,10 +261,15 @@ static void OnIndexChange(void *ctx) {
   if (d) [d writeToFile:[self historyFilePath] options:NSDataWritingAtomic error:NULL];
 }
 
-/* 用户在某词条搜索结果里对文件执行了打开/显示动作：记录 词条 → 文件。 */
-- (void)recordHistory:(NSString *)query row:(MERow *)item {
+/* 用户在某词条搜索结果里对文件执行了打开/显示/固定动作：记录 词条 → 文件。 */
+- (void)recordHistory:(NSString *)query row:(MERow *)item pinned:(BOOL)pinned {
   if (query.length == 0 || item.isTerm || !self.history || item.path.length == 0) return;
-  NSDictionary *fileRec = @{@"p" : item.path, @"n" : item.name ?: @"", @"d" : @(item.isDir)};
+  NSMutableDictionary *fileRec = [NSMutableDictionary dictionaryWithDictionary:@{
+    @"p" : item.path,
+    @"n" : item.name ?: @"",
+    @"d" : @(item.isDir),
+  }];
+  if (pinned) fileRec[@"pin"] = @YES;
   NSUInteger ti = 0;
   for (NSDictionary *t in self.history) {
     if ([t[@"q"] isEqual:query]) break;
@@ -286,7 +292,14 @@ static void OnIndexChange(void *ctx) {
   }
   if (fi < files.count) [files removeObjectAtIndex:fi];
   [files insertObject:fileRec atIndex:0];
-  if (files.count > 20) [files removeObjectsInRange:NSMakeRange(20, files.count - 20)];
+  /* 超限时从尾部裁掉未固定的记录，已固定的保留 */
+  if (files.count > 20) {
+    NSUInteger i = files.count;
+    while (files.count > 20 && i > 0) {
+      i--;
+      if (![files[i][@"pin"] boolValue]) [files removeObjectAtIndex:i];
+    }
+  }
   termDict[@"files"] = files;
   [self.history insertObject:termDict atIndex:0];
   if (self.history.count > 50) [self.history removeObjectsInRange:NSMakeRange(50, self.history.count - 50)];
@@ -301,6 +314,17 @@ static void OnIndexChange(void *ctx) {
 }
 
 /* 点击词条行的 ✕：删除该词条及其文件记录。 */
+/* 右键"固定到首页"：把当前词条 + 文件立即记入首页历史（带固定标记）。 */
+- (void)pinToHome:(id)sender {
+  (void)sender;
+  NSInteger row = self.table.selectedRow;
+  if (row < 0 || (NSUInteger)row >= self.rows.count) return;
+  MERow *item = self.rows[(NSUInteger)row];
+  if (item.isTerm || item.path.length == 0 || self.field.stringValue.length == 0) return;
+  [self recordHistory:self.field.stringValue row:item pinned:YES];
+  self.footer.stringValue = [NSString stringWithFormat:@"📌 已固定到首页：%@", item.name];
+}
+
 - (void)deleteHistoryTerm:(NSButton *)btn {
   NSInteger row = [self.table rowForView:btn];
   if (row < 0 || (NSUInteger)row >= self.rows.count || !self.history) return;
@@ -510,6 +534,9 @@ static void OnIndexChange(void *ctx) {
   NSMenuItem *ctxReveal = [[NSMenuItem alloc] initWithTitle:@"在 Finder 中显示" action:@selector(reveal:) keyEquivalent:@""];
   ctxReveal.target = self;
   [ctx addItem:ctxReveal];
+  NSMenuItem *ctxPin = [[NSMenuItem alloc] initWithTitle:@"📌 固定到首页" action:@selector(pinToHome:) keyEquivalent:@""];
+  ctxPin.target = self;
+  [ctx addItem:ctxPin];
   NSMenuItem *ctxCopy = [[NSMenuItem alloc] initWithTitle:@"拷贝路径" action:@selector(copyPath:) keyEquivalent:@""];
   ctxCopy.target = self;
   [ctx addItem:ctxCopy];
@@ -635,6 +662,9 @@ static OSStatus HotkeyHandler(EventHandlerCallRef next, EventRef event, void *us
         it.action == @selector(copyPath:)) {
       it.enabled = hasRow;
     }
+    if (it.action == @selector(pinToHome:)) {
+      it.enabled = hasRow && self.field.stringValue.length > 0;
+    }
   }
 }
 
@@ -753,10 +783,13 @@ static OSStatus HotkeyHandler(EventHandlerCallRef next, EventRef event, void *us
       [self.rows addObject:tr];
       for (NSDictionary *f in t[@"files"]) {
         MERow *fr = [MERow new];
-        fr.name = f[@"n"];
+        BOOL pinned = [f[@"pin"] boolValue];
+        NSString *baseName = f[@"n"] ?: @"";
+        fr.name = pinned ? [@"📌 " stringByAppendingString:baseName] : baseName;
         fr.path = f[@"p"];
         fr.isDir = [f[@"d"] boolValue];
         fr.indent = 1;
+        fr.pinned = pinned;
         /* 实时 stat：文件被删后大小/时间留空 */
         NSDictionary *st = [NSFileManager.defaultManager attributesOfItemAtPath:fr.path error:NULL];
         if (st) {
@@ -1157,7 +1190,7 @@ static const uint32_t kSearchPage = 300;
     [self searchForTerm:item.term];
     return;
   }
-  [self recordHistory:self.field.stringValue row:item];
+  [self recordHistory:self.field.stringValue row:item pinned:NO];
   NSString *path = item.path;
   NSURL *url = [NSURL fileURLWithPath:path];
   if (reveal) [NSWorkspace.sharedWorkspace activateFileViewerSelectingURLs:@[url]];
