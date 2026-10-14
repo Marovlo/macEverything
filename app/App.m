@@ -21,6 +21,10 @@ static _Atomic uint64_t g_epoch = 0;
 @property(copy) NSString *sizeText;
 @property(copy) NSString *timeText;
 @property BOOL isDir;
+@property BOOL isTerm; /* 历史页的词条行 */
+@property(copy) NSString *term;
+@property NSUInteger termCount;
+@property NSInteger indent;
 @end
 
 @implementation MERow
@@ -54,6 +58,7 @@ static _Atomic uint64_t g_epoch = 0;
 @property(strong) NSScrollView *listScroll;
 @property(strong) NSMenuItem *countItem;
 @property(strong) NSMutableDictionary<NSString *, NSImage *> *iconCache;
+@property(strong) NSMutableArray<NSDictionary *> *history; /* [{q, files:[{p,n,d}]}]，最新在前 */
 @end
 
 static AppDelegate *g_app = nil;
@@ -134,7 +139,7 @@ static void OnIndexChange(void *ctx) {
 
 - (void)finishLaunch {
   [self buildStatus];
-  if (getenv("ME_STATUS_ONLY")) return;
+  [self loadHistory];
   [self buildMainMenu];
   [self buildWindow];
   [self registerHotkey];
@@ -233,6 +238,66 @@ static void OnIndexChange(void *ctx) {
   dispatch_async(dispatch_get_main_queue(), ^{
     self.footer.stringValue = text;
   });
+}
+
+#pragma mark - 搜索历史
+
+- (NSString *)historyFilePath {
+  return [NSHomeDirectory() stringByAppendingPathComponent:
+                        @"Library/Application Support/MacEverything/history.json"];
+}
+
+- (void)loadHistory {
+  NSData *d = [NSData dataWithContentsOfFile:[self historyFilePath]];
+  NSArray *arr = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:NULL] : nil;
+  self.history = [arr isKindOfClass:[NSArray class]] ? [arr mutableCopy] : [NSMutableArray array];
+}
+
+- (void)saveHistory {
+  NSData *d = [NSJSONSerialization dataWithJSONObject:self.history
+                                              options:NSJSONWritingPrettyPrinted
+                                                error:NULL];
+  if (d) [d writeToFile:[self historyFilePath] options:NSDataWritingAtomic error:NULL];
+}
+
+/* 用户在某词条搜索结果里对文件执行了打开/显示动作：记录 词条 → 文件。 */
+- (void)recordHistory:(NSString *)query row:(MERow *)item {
+  if (query.length == 0 || item.isTerm || !self.history || item.path.length == 0) return;
+  NSDictionary *fileRec = @{@"p" : item.path, @"n" : item.name ?: @"", @"d" : @(item.isDir)};
+  NSUInteger ti = 0;
+  for (NSDictionary *t in self.history) {
+    if ([t[@"q"] isEqual:query]) break;
+    ti++;
+  }
+  NSMutableDictionary *termDict;
+  if (ti < self.history.count) {
+    termDict = [self.history[ti] mutableCopy];
+    [self.history removeObjectAtIndex:ti];
+  } else {
+    termDict = [NSMutableDictionary dictionaryWithObject:query forKey:@"q"];
+  }
+  NSMutableArray *files = [termDict[@"files"] isKindOfClass:[NSArray class]]
+                              ? [termDict[@"files"] mutableCopy]
+                              : [NSMutableArray array];
+  NSUInteger fi = 0;
+  for (NSDictionary *f in files) {
+    if ([f[@"p"] isEqual:fileRec[@"p"]]) break;
+    fi++;
+  }
+  if (fi < files.count) [files removeObjectAtIndex:fi];
+  [files insertObject:fileRec atIndex:0];
+  if (files.count > 20) [files removeObjectsInRange:NSMakeRange(20, files.count - 20)];
+  termDict[@"files"] = files;
+  [self.history insertObject:termDict atIndex:0];
+  if (self.history.count > 50) [self.history removeObjectsInRange:NSMakeRange(50, self.history.count - 50)];
+  [self saveHistory];
+}
+
+/* 历史页点击词条：填入搜索框并重新搜索。 */
+- (void)searchForTerm:(NSString *)term {
+  if (term.length == 0) return;
+  if (![self.field.stringValue isEqualToString:term]) self.field.stringValue = term;
+  [self scheduleSearch];
 }
 
 - (void)useIndex:(MEIndex *)idx {
@@ -521,8 +586,10 @@ static OSStatus HotkeyHandler(EventHandlerCallRef next, EventRef event, void *us
   (void)sender;
   NSInteger row = self.table.selectedRow;
   if (row < 0 || (NSUInteger)row >= self.rows.count) return;
+  MERow *item = self.rows[(NSUInteger)row];
+  if (item.isTerm || item.path.length == 0) return;
   [NSPasteboard.generalPasteboard clearContents];
-  [NSPasteboard.generalPasteboard setString:self.rows[(NSUInteger)row].path forType:NSPasteboardTypeString];
+  [NSPasteboard.generalPasteboard setString:item.path forType:NSPasteboardTypeString];
 }
 
 - (BOOL)validateMenuItem:(NSMenuItem *)item {
@@ -543,7 +610,10 @@ static OSStatus HotkeyHandler(EventHandlerCallRef next, EventRef event, void *us
     [table selectRowIndexes:[NSIndexSet indexSetWithIndex:(NSUInteger)row] byExtendingSelection:NO];
   }
   NSInteger active = table.selectedRow >= 0 ? table.selectedRow : table.clickedRow;
-  BOOL hasRow = active >= 0;
+  BOOL hasRow = NO;
+  if (active >= 0 && active < (NSInteger)self.rows.count) {
+    hasRow = !self.rows[(NSUInteger)active].isTerm;
+  }
   for (NSMenuItem *it in table.menu.itemArray) {
     if (it.action == @selector(open:) || it.action == @selector(reveal:) ||
         it.action == @selector(copyPath:)) {
@@ -655,10 +725,32 @@ static OSStatus HotkeyHandler(EventHandlerCallRef next, EventRef event, void *us
     free(self.resultIds);
     self.resultIds = NULL;
     self.resultCount = 0;
+    /* 首页展示搜索历史：词条行 + 缩进的文件行 */
     self.rows = [NSMutableArray array];
+    for (NSDictionary *t in self.history) {
+      MERow *tr = [MERow new];
+      tr.isTerm = YES;
+      tr.term = t[@"q"];
+      tr.termCount = [t[@"files"] count];
+      tr.name = tr.term;
+      tr.indent = 0;
+      [self.rows addObject:tr];
+      for (NSDictionary *f in t[@"files"]) {
+        MERow *fr = [MERow new];
+        fr.name = f[@"n"];
+        fr.path = f[@"p"];
+        fr.isDir = [f[@"d"] boolValue];
+        fr.sizeText = @"";
+        fr.timeText = @"";
+        fr.indent = 1;
+        [self.rows addObject:fr];
+      }
+    }
     [self.table reloadData];
-    NSString *extra = self.skippedProtected ? @" · 桌面、文稿、下载需要完全磁盘访问" : @"";
-    self.footer.stringValue = [NSString stringWithFormat:@"匹配 0 个文件%@", extra];
+    self.footer.stringValue =
+        self.history.count
+            ? [NSString stringWithFormat:@"搜索历史 %lu 条", (unsigned long)self.history.count]
+            : @"输入文件名开始搜索";
     return;
   }
   uint64_t epoch = atomic_fetch_add(&g_epoch, 1) + 1;
@@ -738,6 +830,7 @@ static const uint32_t kSearchPage = 300;
 
 - (void)loadMoreSearchIfNeeded {
   if (self.searchLoading || !self.ready) return;
+  if (self.field.stringValue.length == 0) return; /* 历史页不需要分页 */
   if (self.searchTotal == 0 || self.rows.count >= self.searchTotal) return;
   if (!self.resultIds) return;
   NSClipView *clip = self.listScroll.contentView;
@@ -880,11 +973,13 @@ static const uint32_t kSearchPage = 300;
       iv.tag = 2;
       iv.translatesAutoresizingMaskIntoConstraints = NO;
       [cell addSubview:iv];
+      NSLayoutConstraint *lead =
+          [tf.leadingAnchor constraintEqualToAnchor:iv.trailingAnchor constant:6];
       [NSLayoutConstraint activateConstraints:@[
         [iv.leadingAnchor constraintEqualToAnchor:cell.leadingAnchor constant:2],
         [iv.widthAnchor constraintEqualToAnchor:cell.heightAnchor],
         [iv.centerYAnchor constraintEqualToAnchor:cell.centerYAnchor],
-        [tf.leadingAnchor constraintEqualToAnchor:iv.trailingAnchor constant:6],
+        lead,
       ]];
     } else {
       [NSLayoutConstraint activateConstraints:@[
@@ -898,20 +993,56 @@ static const uint32_t kSearchPage = 300;
   }
   NSTextField *tf = [cell viewWithTag:1];
   NSImageView *iv = [cell viewWithTag:2];
-  if ([ident isEqualToString:@"name"]) {
+  BOOL isNameCol = [ident isEqualToString:@"name"];
+  if (isNameCol) {
+    /* 历史页文件行按层级缩进名称列（图标与文字一起偏移） */
+    for (NSLayoutConstraint *c in cell.constraints) {
+      if (c.firstItem == tf && c.firstAttribute == NSLayoutAttributeLeading) {
+        c.constant = 6 + 18.0 * item.indent;
+      }
+      if (c.firstItem == iv && c.firstAttribute == NSLayoutAttributeLeading) {
+        c.constant = 2 + 18.0 * item.indent;
+      }
+    }
+  }
+  if (item.isTerm) {
+    if (isNameCol) {
+      NSMutableAttributedString *as = [[NSMutableAttributedString alloc]
+          initWithString:[NSString stringWithFormat:@"🔍 %@　", item.term]
+              attributes:@{
+                NSFontAttributeName : [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold],
+                NSForegroundColorAttributeName : NSColor.labelColor,
+              }];
+      [as appendAttributedString:[[NSAttributedString alloc]
+                                      initWithString:[NSString stringWithFormat:@"%lu 个文件",
+                                                                                (unsigned long)item.termCount]
+                                          attributes:@{
+                                            NSFontAttributeName : [NSFont systemFontOfSize:12],
+                                            NSForegroundColorAttributeName : NSColor.secondaryLabelColor,
+                                          }]];
+      tf.attributedStringValue = as;
+      NSImage *icon = [NSImage imageWithSystemSymbolName:@"clock.arrow.circlepath"
+                                  accessibilityDescription:@"搜索历史"];
+      icon.size = NSMakeSize(15, 15);
+      iv.image = icon;
+    } else {
+      tf.stringValue = @"";
+      iv.image = nil;
+    }
+  } else if (isNameCol) {
     tf.attributedStringValue = [self highlightedName:item.name];
     iv.image = [self iconFor:item];
   } else if ([ident isEqualToString:@"path"]) {
-    tf.stringValue = item.path;
+    tf.stringValue = item.isTerm ? @"" : item.path;
     tf.textColor = NSColor.secondaryLabelColor;
   } else if ([ident isEqualToString:@"size"]) {
-    tf.stringValue = item.sizeText;
+    tf.stringValue = item.isTerm ? @"" : item.sizeText;
     tf.textColor = NSColor.secondaryLabelColor;
   } else {
-    tf.stringValue = item.timeText;
+    tf.stringValue = item.isTerm ? @"" : item.timeText;
     tf.textColor = NSColor.secondaryLabelColor;
   }
-  cell.toolTip = item.path;
+  cell.toolTip = item.isTerm ? nil : item.path;
   return cell;
 }
 
@@ -943,7 +1074,13 @@ static const uint32_t kSearchPage = 300;
   NSInteger row = self.table.selectedRow;
   if (row < 0 && self.rows.count > 0) row = 0;
   if (row < 0 || (NSUInteger)row >= self.rows.count) return;
-  NSString *path = self.rows[(NSUInteger)row].path;
+  MERow *item = self.rows[(NSUInteger)row];
+  if (item.isTerm) {
+    [self searchForTerm:item.term];
+    return;
+  }
+  [self recordHistory:self.field.stringValue row:item];
+  NSString *path = item.path;
   NSURL *url = [NSURL fileURLWithPath:path];
   if (reveal) [NSWorkspace.sharedWorkspace activateFileViewerSelectingURLs:@[url]];
   else [NSWorkspace.sharedWorkspace openURL:url];
@@ -954,7 +1091,12 @@ static const uint32_t kSearchPage = 300;
   (void)control;
   (void)textView;
   if (command == @selector(insertNewline:)) {
-    // 回车不再打开文件；⌘回车在 Finder 中显示
+    // 回车不再打开文件；历史页词条行回车=重新搜索；⌘回车在 Finder 中显示
+    NSInteger row = self.table.selectedRow;
+    if (row >= 0 && (NSUInteger)row < self.rows.count && self.rows[(NSUInteger)row].isTerm) {
+      [self searchForTerm:self.rows[(NSUInteger)row].term];
+      return YES;
+    }
     if ((NSApp.currentEvent.modifierFlags & NSEventModifierFlagCommand) != 0) {
       [self revealOrOpen:YES];
     }
