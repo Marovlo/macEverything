@@ -60,6 +60,9 @@ static _Atomic uint64_t g_epoch = 0;
 @property(strong) NSMenuItem *countItem;
 @property(strong) NSMutableDictionary<NSString *, NSImage *> *iconCache;
 @property(strong) NSMutableArray<NSDictionary *> *history; /* [{q, files:[{p,n,d}]}]，最新在前 */
+@property BOOL fdaGrantedCached; /* 完全磁盘访问已授权（缓存） */
+@property BOOL fdaStateKnown;
+@property BOOL fdaCheckInFlight;
 @end
 
 static AppDelegate *g_app = nil;
@@ -154,17 +157,39 @@ static void OnIndexChange(void *ctx) {
   return got ? denied : YES; /* 超时未返回 = 被 TCC 挡住 */
 }
 
+/* 异步刷新授权状态缓存（被拒时后台探测会阻塞，in-flight 防止堆积）。 */
+- (void)refreshFDAStateAsync {
+  if (self.fdaCheckInFlight) return;
+  self.fdaCheckInFlight = YES;
+  NSString *desktop = [NSHomeDirectory() stringByAppendingPathComponent:@"Desktop"];
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+    NSError *err = nil;
+    [NSFileManager.defaultManager contentsOfDirectoryAtPath:desktop error:&err];
+    BOOL granted = err == nil;
+    dispatch_async(dispatch_get_main_queue(), ^{
+      self.fdaCheckInFlight = NO;
+      if (granted != self.fdaGrantedCached || !self.fdaStateKnown) {
+        self.fdaGrantedCached = granted;
+        self.fdaStateKnown = YES;
+      }
+    });
+  });
+}
+
 /* 首次启动且检测到受保护目录不可读时，引导用户授予完全磁盘访问（只提示一次）。 */
 - (void)maybePromptForFDA {
   NSString *askedKey = @"MEAskedFDA1";
   if ([NSUserDefaults.standardUserDefaults boolForKey:askedKey]) return;
   [NSUserDefaults.standardUserDefaults setBool:YES forKey:askedKey];
-  if (![self fdaLikelyDenied]) return;
+  BOOL denied = [self fdaLikelyDenied];
+  self.fdaGrantedCached = !denied;
+  self.fdaStateKnown = YES;
+  if (!denied) return;
   NSAlert *alert = [NSAlert new];
   alert.messageText = @"授予完全磁盘访问权限";
   alert.informativeText =
       @"MacEverything 需要完全磁盘访问权限，才能搜索桌面、文稿、下载等受保护目录。\n\n"
-       "现在去系统设置授权吗？授权后需要重新打开应用生效。";
+       "现在去系统设置授权吗？在开关处授权后，系统会提示重新打开应用。";
   [alert addButtonWithTitle:@"打开系统设置"];
   [alert addButtonWithTitle:@"以后再说"];
   alert.alertStyle = NSAlertStyleInformational;
@@ -193,9 +218,10 @@ static void OnIndexChange(void *ctx) {
   [NSTimer scheduledTimerWithTimeInterval:10 target:self selector:@selector(checkpoint) userInfo:nil repeats:YES];
   [NSTimer scheduledTimerWithTimeInterval:3600 target:self selector:@selector(checkForUpdates) userInfo:nil repeats:YES];
   [self checkForUpdates];
-  /* 窗口就绪后延迟 1 秒，首次启动引导完全磁盘访问 */
+  /* 窗口就绪后延迟 1 秒：刷新授权状态缓存 + 首次启动引导完全磁盘访问 */
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                  dispatch_get_main_queue(), ^{
+                   [self refreshFDAStateAsync];
                    [self maybePromptForFDA];
                  });
 }
@@ -402,6 +428,8 @@ static void OnIndexChange(void *ctx) {
     self.skippedProtected = skipped;
     self.idx = fresh;
     self.ready = YES;
+    self.fdaGrantedCached = !skipped;
+    self.fdaStateKnown = YES;
     [self tick];
     if (self.window.isVisible) [self scheduleSearch];
     if (old && old != fresh) {
@@ -679,6 +707,10 @@ static OSStatus HotkeyHandler(EventHandlerCallRef next, EventRef event, void *us
     return self.table.selectedRow >= 0;
   }
   if (item.action == @selector(reindex)) return !self.quitting && !me_index_scanning(self.idx);
+  if (item.action == @selector(openPrivacy)) {
+    [self refreshFDAStateAsync]; /* 打开菜单时惰性刷新，不阻塞菜单弹出 */
+    return !self.fdaStateKnown ? YES : !self.fdaGrantedCached; /* 已授权则置灰 */
+  }
   return YES;
 }
 
@@ -1323,6 +1355,8 @@ static const uint32_t kSearchPage = 300;
       self.idx = fresh;
       self.ready = YES;
       self.skippedProtected = skipped;
+      self.fdaGrantedCached = !skipped;
+      self.fdaStateKnown = YES;
       [self tick];
       if (self.window.isVisible) [self scheduleSearch];
     });
@@ -1330,40 +1364,11 @@ static const uint32_t kSearchPage = 300;
 }
 
 - (void)openPrivacy {
-  [self showWindow];
+  /* 只负责跳转系统设置；用户拨动开关后，系统自己会弹出"退出并重新打开"提示 */
   NSURL *modern = [NSURL URLWithString:@"x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AllFiles"];
   NSURL *legacy = [NSURL URLWithString:@"x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"];
   if (![NSWorkspace.sharedWorkspace openURL:modern]) [NSWorkspace.sharedWorkspace openURL:legacy];
-  NSAlert *alert = [NSAlert new];
-  alert.messageText = @"完全磁盘访问要重新打开才生效";
-  alert.informativeText = @"系统不会把刚授予的权限交给已经在运行的 MacEverything。点「重新打开」会退出并再启动，然后重新索引主目录。桌面、文稿、下载才会进入索引。";
-  [alert addButtonWithTitle:@"重新打开"];
-  [alert addButtonWithTitle:@"只打开设置"];
-  [alert beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse response) {
-    if (response == NSAlertFirstButtonReturn) [self relaunch];
-  }];
-}
-
-- (void)relaunch {
-  self.skipSave = YES;
-  if (self.indexPath.length) {
-    unlink(self.indexPath.UTF8String);
-    unlink([self.indexPath stringByAppendingString:@".eid"].UTF8String);
-  }
-  NSWorkspaceOpenConfiguration *cfg = [NSWorkspaceOpenConfiguration configuration];
-  cfg.createsNewApplicationInstance = YES;
-  cfg.arguments = @[@"--rescan"];
-  NSURL *url = NSBundle.mainBundle.bundleURL;
-  [NSWorkspace.sharedWorkspace openApplicationAtURL:url configuration:cfg completionHandler:^(NSRunningApplication *app, NSError *error) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-      if (!app) {
-        self.skipSave = NO;
-        self.footer.stringValue = error.localizedDescription ?: @"重新打开失败";
-        return;
-      }
-      [NSApp terminate:nil];
-    });
-  }];
+  [self refreshFDAStateAsync];
 }
 
 static NSArray<NSString *> *VersionParts(NSString *s) {
