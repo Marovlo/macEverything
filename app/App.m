@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 extern char **environ;
@@ -71,6 +72,7 @@ static _Atomic uint64_t g_epoch = 0;
 @property(nonatomic, assign) MEIndex *lastTickIdx;
 @property(nonatomic, assign) MEIndex *powerWatchAppliedTo; /* 已应用省电模式的索引 */
 @property BOOL cmdSpaceOK;                /* 已接管 ⌘Space */
+@property void *cmdSpaceHotKey;           /* ⌘Space 热键句柄，用于取消注册 */
 @end
 
 static AppDelegate *g_app = nil;
@@ -239,11 +241,15 @@ static void OnIndexChange(void *ctx) {
   [NSTimer scheduledTimerWithTimeInterval:10 target:self selector:@selector(checkpoint) userInfo:nil repeats:YES];
   [NSTimer scheduledTimerWithTimeInterval:3600 target:self selector:@selector(checkForUpdates) userInfo:nil repeats:YES];
   [self checkForUpdates];
-  /* 窗口就绪后延迟 1 秒：刷新授权状态缓存 + 首次启动引导完全磁盘访问 */
+  /* 窗口就绪后延迟 1 秒：刷新授权状态缓存 + 首次启动引导完全磁盘访问 + 征询 ⌘Space 接管 */
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                  dispatch_get_main_queue(), ^{
                    [self refreshFDAStateAsync];
                    [self maybePromptForFDA];
+                   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                                  dispatch_get_main_queue(), ^{
+                                    [self maybePromptForCmdSpace];
+                                  });
                  });
 }
 
@@ -540,6 +546,9 @@ static void OnIndexChange(void *ctx) {
   NSMenuItem *fda = [[NSMenuItem alloc] initWithTitle:@"打开完全磁盘访问权限" action:@selector(openPrivacy) keyEquivalent:@""];
   fda.target = self;
   [menu addItem:fda];
+  NSMenuItem *cmdSpaceItem = [[NSMenuItem alloc] initWithTitle:@"接管 ⌘Space 呼出搜索" action:@selector(toggleCmdSpace:) keyEquivalent:@""];
+  cmdSpaceItem.target = self;
+  [menu addItem:cmdSpaceItem];
   NSMenuItem *updates = [[NSMenuItem alloc] initWithTitle:@"检查更新" action:@selector(checkForUpdatesNow:) keyEquivalent:@""];
   updates.target = self;
   [menu addItem:updates];
@@ -691,10 +700,81 @@ static OSStatus HotkeyHandler(EventHandlerCallRef next, EventRef event, void *us
   BOOL spotlightEnabled = h64 ? [h64[@"enabled"] boolValue] : YES;
   if (spotlightEnabled) return;
   EventHotKeyID hid = {'MEVY', 1};
-  if (RegisterEventHotKey(kVK_Space, cmdKey, hid, GetApplicationEventTarget(), 0, NULL) == noErr) {
+  EventHotKeyRef ref = NULL;
+  if (RegisterEventHotKey(kVK_Space, cmdKey, hid, GetApplicationEventTarget(), 0, &ref) == noErr) {
     self.cmdSpaceOK = YES;
+    self.cmdSpaceHotKey = ref;
     self.status.button.toolTip = @"MacEverything  ⌘Space / ⌃⌥Space 呼出，右键菜单";
   }
+}
+
+/* 改写系统符号快捷键 64 的启用状态并应用（activateSettings -u）。 */
+- (BOOL)applySpotlightCmdSpaceEnabled:(BOOL)enable {
+  NSString *domain = @"com.apple.symbolichotkeys";
+  NSDictionary *hotkeys = CFBridgingRelease(
+      CFPreferencesCopyAppValue(CFSTR("AppleSymbolicHotKeys"), (__bridge CFStringRef)domain));
+  NSMutableDictionary *mutable = [hotkeys isKindOfClass:[NSDictionary class]]
+                                     ? [hotkeys mutableCopy]
+                                     : [NSMutableDictionary dictionary];
+  NSMutableDictionary *entry = [mutable[@"64"] isKindOfClass:[NSDictionary class]]
+                                   ? [mutable[@"64"] mutableCopy]
+                                   : [NSMutableDictionary dictionary];
+  entry[@"enabled"] = @(enable ? 1 : 0);
+  if (!entry[@"value"]) {
+    entry[@"value"] = @{@"parameters" : @[@65535, @1048576, @49], @"type" : @"standard"}; /* ⌘Space */
+    entry[@"type"] = @"standard";
+  }
+  mutable[@"64"] = entry;
+  CFPreferencesSetAppValue(CFSTR("AppleSymbolicHotKeys"), (__bridge CFTypeRef)mutable,
+                           (__bridge CFStringRef)domain);
+  CFPreferencesAppSynchronize((__bridge CFStringRef)domain);
+  /* 通知系统重新应用快捷键设置 */
+  pid_t pid = -1;
+  char *argv[] = {(char *)"/System/Library/PrivateFrameworks/SystemAdministration.framework/"
+                          "Resources/activateSettings",
+                  (char *)"-u", NULL};
+  if (posix_spawn(&pid, argv[0], NULL, NULL, argv, environ) == 0 && pid > 0) {
+    waitpid(pid, NULL, 0);
+  }
+  return YES;
+}
+
+/* 状态栏菜单开关：接管 = 关闭 Spotlight 的 ⌘Space 并注册自己；还原 = 反之。 */
+- (void)toggleCmdSpace:(id)sender {
+  (void)sender;
+  if (self.cmdSpaceOK) {
+    if (self.cmdSpaceHotKey) {
+      UnregisterEventHotKey((EventHotKeyRef)self.cmdSpaceHotKey);
+      self.cmdSpaceHotKey = NULL;
+    }
+    self.cmdSpaceOK = NO;
+    [self applySpotlightCmdSpaceEnabled:YES];
+  } else {
+    [self applySpotlightCmdSpaceEnabled:NO];
+    [self tryRegisterCmdSpace];
+  }
+}
+
+/* 首次启动征询：是否接管 ⌘Space（只询问一次）。 */
+- (void)maybePromptForCmdSpace {
+  if (self.cmdSpaceOK) return;
+  NSString *key = @"MEAskedCmdSpace";
+  if ([NSUserDefaults.standardUserDefaults boolForKey:key]) return;
+  [NSUserDefaults.standardUserDefaults setBool:YES forKey:key];
+  NSDictionary *sh = CFBridgingRelease(CFPreferencesCopyAppValue(CFSTR("AppleSymbolicHotKeys"),
+                                                                 CFSTR("com.apple.symbolichotkeys")));
+  NSDictionary *h64 = sh[@"64"];
+  BOOL spotlightEnabled = h64 ? [h64[@"enabled"] boolValue] : YES;
+  if (!spotlightEnabled) return; /* Spotlight 已让出，无需征询 */
+  NSAlert *alert = [NSAlert new];
+  alert.messageText = @"接管 ⌘Space 呼出搜索？";
+  alert.informativeText =
+      @"把 ⌘Space 从 Spotlight 切换给 MacEverything 呼出搜索窗口。\n\n"
+       "Spotlight 仍可从菜单栏图标打开；随时可在 MacEverything 的状态栏菜单里还原。";
+  [alert addButtonWithTitle:@"接管 ⌘Space"];
+  [alert addButtonWithTitle:@"暂不"];
+  alert.alertStyle = NSAlertStyleInformational;
+  if ([alert runModal] == NSAlertFirstButtonReturn) [self toggleCmdSpace:nil];
 }
 
 // LSUIElement 应用也需要主菜单，⌘Q/⌘W/⌘C 等键位等效只有通过主菜单才全局生效。
@@ -753,6 +833,11 @@ static OSStatus HotkeyHandler(EventHandlerCallRef next, EventRef event, void *us
   if (item.action == @selector(openPrivacy)) {
     [self refreshFDAStateAsync]; /* 打开菜单时惰性刷新，不阻塞菜单弹出 */
     return !self.fdaStateKnown ? YES : !self.fdaGrantedCached; /* 已授权则置灰 */
+  }
+  if (item.action == @selector(toggleCmdSpace:)) {
+    item.state = self.cmdSpaceOK ? NSControlStateValueOn : NSControlStateValueOff;
+    item.title = self.cmdSpaceOK ? @"还原 Spotlight 的 ⌘Space" : @"接管 ⌘Space 呼出搜索";
+    return YES;
   }
   return YES;
 }
