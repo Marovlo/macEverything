@@ -73,10 +73,23 @@ static _Atomic uint64_t g_epoch = 0;
 @property(nonatomic, assign) MEIndex *lastTickIdx;
 @property(nonatomic, assign) MEIndex *powerWatchAppliedTo; /* 已应用省电模式的索引 */
 @property BOOL cmdSpaceOK;                /* 已接管 ⌘Space */
+@property(strong) NSWindow *updateProgressWindow;
+@property(strong) NSProgressIndicator *updateProgressBar;
+@property(strong) NSTextField *updateProgressText;
+@property(strong) NSURLSession *updateSession;
+@property(strong) id updateSessionDelegate;
 @property void *cmdSpaceHotKey;           /* ⌘Space 热键句柄，用于取消注册 */
 @end
 
 static AppDelegate *g_app = nil;
+static NSString *CurrentVersion(void);
+static void MEFrameLog(NSString *tag, NSWindow *w) {
+  FILE *f = fopen("/tmp/me-frame.log", "a");
+  if (!f) return;
+  NSRect r = w.frame;
+  fprintf(f, "%s: %s\n", tag.UTF8String, NSStringFromRect(r).UTF8String);
+  fclose(f);
+}
 static void *MEKvoOcclusion = &MEKvoOcclusion;
 
 @class AppDelegate;
@@ -87,6 +100,38 @@ static void *MEKvoOcclusion = &MEKvoOcclusion;
 @class AppDelegate;
 @interface METableView : NSTableView
 @property(nonatomic, weak) AppDelegate *owner;
+@end
+
+
+@interface MEUpdateDownloader : NSObject <NSURLSessionDownloadDelegate>
+@property(copy) void (^onProgress)(double frac, int64_t written, int64_t total);
+@property(copy) void (^onDone)(NSURL *file, NSError *error);
+@property(copy) NSString *destination;
+@end
+@implementation MEUpdateDownloader
+- (void)URLSession:(NSURLSession *)session downloadTask:(NSURLSessionDownloadTask *)task
+      didWriteData:(int64_t)bytesWritten totalBytesWritten:(int64_t)totalBytesWritten
+totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite {
+  double frac = totalBytesExpectedToWrite > 0
+                    ? (double)totalBytesWritten / (double)totalBytesExpectedToWrite
+                    : 0;
+  if (self.onProgress) self.onProgress(frac, totalBytesWritten, totalBytesExpectedToWrite);
+}
+- (void)URLSession:(NSURLSession *)session downloadTask:(NSURLSessionDownloadTask *)task
+    didFinishDownloadingToURL:(NSURL *)location {
+  NSError *err = nil;
+  NSURL *dst = nil;
+  if (self.destination) {
+    [NSFileManager.defaultManager removeItemAtPath:self.destination error:NULL];
+    dst = [NSURL fileURLWithPath:self.destination];
+    [NSFileManager.defaultManager moveItemAtURL:location toURL:dst error:&err];
+  }
+  if (self.onDone) self.onDone(err ? nil : dst, err);
+}
+- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task
+    didCompleteWithError:(NSError *)error {
+  if (error && self.onDone) self.onDone(nil, error);
+}
 @end
 
 @implementation AppDelegate
@@ -221,10 +266,18 @@ static void OnIndexChange(void *ctx) {
 
 - (void)finishLaunch {
   [self buildStatus];
+  {
+    NSString *lastRun = [NSUserDefaults.standardUserDefaults stringForKey:@"MELastRunVersion"];
+    NSString *cur = CurrentVersion() ?: @"?";
+    [NSUserDefaults.standardUserDefaults setObject:cur forKey:@"MELastRunVersion"];
+    if (lastRun.length && ![lastRun isEqualToString:cur])
+      [self showFooter:[NSString stringWithFormat:@"✓ 已更新到 v%@。", cur]];
+  }
   [self loadHistory];
   [self buildMainMenu];
   [self buildWindow];
   [self registerHotkey];
+  MEFrameLog(@"before-showWindow", self.window);
   [self showWindow];
   NSString *envIndex = NSProcessInfo.processInfo.environment[@"ME_INDEX"];
   NSString *envRoot = NSProcessInfo.processInfo.environment[@"ME_ROOT"];
@@ -590,13 +643,19 @@ static void OnIndexChange(void *ctx) {
   self.window.title = @"MacEverything";
   self.window.delegate = self;
   self.window.collectionBehavior = NSWindowCollectionBehaviorMoveToActiveSpace | NSWindowCollectionBehaviorFullScreenAuxiliary;
-  self.window.contentMinSize = NSMakeSize(520, 260);
-  self.window.frameAutosaveName = @"MESearchWindow";
   [self.window addObserver:self
                 forKeyPath:@"occlusionState"
                    options:0
                    context:MEKvoOcclusion];
+  { /* 手动恢复窗口框架（Tahoe 的 frameAutosaveName 会把窗口重设为内容适配尺寸） */
+    NSString *saved = [NSUserDefaults.standardUserDefaults stringForKey:@"MEWindowFrame"];
+    if (saved.length) {
+      NSRect f = NSRectFromString(saved);
+      if (f.size.width >= 552 && f.size.height >= 300) [self.window setFrame:f display:NO];
+    }
+  }
   [self.window center];
+  MEFrameLog(@"after-init+restore", self.window);
   NSView *content = self.window.contentView;
   self.field = [NSSearchField new];
   self.field.placeholderString = @"输入文件名搜索";
@@ -664,6 +723,11 @@ static void OnIndexChange(void *ctx) {
   self.field.translatesAutoresizingMaskIntoConstraints = NO;
   scroll.translatesAutoresizingMaskIntoConstraints = NO;
   self.footer.translatesAutoresizingMaskIntoConstraints = NO;
+  /* 页脚与版本号：低优先级间距（长文本压缩截断，不与窗口尺寸对抗） */
+  NSLayoutConstraint *footerTrail =
+      [self.footer.trailingAnchor constraintLessThanOrEqualToAnchor:self.versionLabel.leadingAnchor
+                                                           constant:-12];
+  footerTrail.priority = 500;
   [NSLayoutConstraint activateConstraints:@[
     [self.field.topAnchor constraintEqualToAnchor:content.topAnchor constant:12],
     [self.field.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:12],
@@ -673,13 +737,19 @@ static void OnIndexChange(void *ctx) {
     [scroll.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-12],
     [scroll.bottomAnchor constraintEqualToAnchor:self.footer.topAnchor constant:-8],
     [self.footer.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:14],
-    [self.footer.trailingAnchor constraintLessThanOrEqualToAnchor:self.versionLabel.leadingAnchor constant:-12],
+    footerTrail,
     [self.footer.bottomAnchor constraintEqualToAnchor:content.bottomAnchor constant:-10],
     [self.versionLabel.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-14],
     [self.versionLabel.centerYAnchor constraintEqualToAnchor:self.footer.centerYAnchor],
     [self.versionLabel.leadingAnchor
-        constraintGreaterThanOrEqualToAnchor:self.footer.trailingAnchor constant:12],
+        constraintGreaterThanOrEqualToAnchor:content.leadingAnchor constant:14],
+    /* 内容宽度下限：防止 AutoLayout 把窗口收缩到适配宽度 */
+    [content.widthAnchor constraintGreaterThanOrEqualToConstant:970],
   ]];
+  [self.footer setContentCompressionResistancePriority:250
+                                forOrientation:NSLayoutConstraintOrientationHorizontal];
+  [self.versionLabel setContentCompressionResistancePriority:250
+                                      forOrientation:NSLayoutConstraintOrientationHorizontal];
 }
 
 static OSStatus HotkeyHandler(EventHandlerCallRef next, EventRef event, void *user) {
@@ -915,6 +985,7 @@ static OSStatus HotkeyHandler(EventHandlerCallRef next, EventRef event, void *us
 }
 
 - (void)showWindowCentered:(BOOL)centered {
+  MEFrameLog([NSString stringWithFormat:@"showWindowCentered entered %d", centered], self.window);
   if (NSApp.hidden) [NSApp unhide:nil];
   if (self.window.miniaturized) [self.window deminiaturize:nil];
   NSWindow *statusWin = self.status.button.window;
@@ -954,13 +1025,36 @@ static OSStatus HotkeyHandler(EventHandlerCallRef next, EventRef event, void *us
                  dispatch_get_main_queue(), ^{
                    [self ensureWindowOnScreen];
                  });
+  MEFrameLog(@"showWindow end", self.window);
   [self.window makeFirstResponder:self.field];
   [self scheduleSearch];
 }
 
-/* 窗口落在所有屏幕之外（如外接显示器被拔掉）时，拉回主屏居中。 */
+- (void)windowDidMove:(NSNotification *)notification {
+  (void)notification;
+  if (self.window.isVisible)
+    [NSUserDefaults.standardUserDefaults setObject:NSStringFromRect(self.window.frame)
+                                           forKey:@"MEWindowFrame"];
+}
+
+- (void)windowDidEndLiveResize:(NSNotification *)notification {
+  (void)notification;
+  if (self.window.isVisible)
+    [NSUserDefaults.standardUserDefaults setObject:NSStringFromRect(self.window.frame)
+                                           forKey:@"MEWindowFrame"];
+}
+
+/* 用委托限制最小尺寸：Tahoe 上设置 contentMinSize 会立即把窗口钳到最小宽度。 */
+- (BOOL)windowShouldResize:(NSWindow *)window toSize:(NSSize)frameSize {
+  (void)window;
+  return frameSize.width >= 1002 && frameSize.height >= 300;
+}
+
+/* 窗口自检：宽度异常收窄（AutoLayout 适配宽度所致）时恢复默认宽度；
+   落在所有屏幕之外（如外接显示器被拔掉）时，拉回主屏居中。 */
 - (void)ensureWindowOnScreen {
   NSRect wf = self.window.frame;
+  if (NSWidth(wf) < 700) wf.size.width = 1080;
   BOOL onScreen = NO;
   for (NSScreen *s in NSScreen.screens) {
     if (NSIntersectsRect(wf, s.frame)) {
@@ -968,14 +1062,15 @@ static OSStatus HotkeyHandler(EventHandlerCallRef next, EventRef event, void *us
       break;
     }
   }
-  if (onScreen) return;
   NSScreen *screen = NSScreen.mainScreen ?: NSScreen.screens.firstObject;
-  if (!screen) return;
-  NSRect vis = screen.visibleFrame;
-  CGFloat w = MIN(NSWidth(wf), NSWidth(vis));
-  CGFloat h = MIN(NSHeight(wf), NSHeight(vis));
-  NSRect r = NSMakeRect(NSMidX(vis) - w / 2.0, NSMinY(vis) + (NSHeight(vis) - h) / 2.0, w, h);
-  [self.window setFrame:r display:YES];
+  if (!onScreen && screen) {
+    NSRect vis = screen.visibleFrame;
+    wf.size.width = MIN(NSWidth(wf), NSWidth(vis));
+    wf.size.height = MIN(NSHeight(wf), NSHeight(vis));
+    wf.origin.x = NSMidX(vis) - NSWidth(wf) / 2.0;
+    wf.origin.y = NSMinY(vis) + (NSHeight(vis) - NSHeight(wf)) / 2.0;
+  }
+  [self.window setFrame:wf display:YES];
 }
 
 /* 前后台省电模式：窗口不在视野内时，UI 轮询与文件监视都降到 60 秒。 */
@@ -1627,44 +1722,97 @@ static NSString *CurrentVersion(void) {
   }
 }
 
+#pragma mark - 更新进度面板
+
+- (void)beginUpdateProgress {
+  if (self.updateProgressWindow) return;
+  NSWindow *w = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 340, 88)
+                                            styleMask:NSWindowStyleMaskTitled
+                                              backing:NSBackingStoreBuffered
+                                                defer:NO];
+  w.title = @"软件更新";
+  w.releasedWhenClosed = NO;
+  NSProgressIndicator *bar = [[NSProgressIndicator alloc] initWithFrame:NSMakeRect(20, 44, 300, 8)];
+  [bar setIndeterminate:NO];
+  bar.minValue = 0;
+  bar.maxValue = 1;
+  bar.doubleValue = 0;
+  NSTextField *text = [NSTextField labelWithString:@"正在准备更新…"];
+  text.frame = NSMakeRect(20, 16, 300, 18);
+  text.font = [NSFont systemFontOfSize:12];
+  text.textColor = NSColor.secondaryLabelColor;
+  text.lineBreakMode = NSLineBreakByTruncatingTail;
+  NSView *content = w.contentView;
+  [content addSubview:bar];
+  [content addSubview:text];
+  self.updateProgressWindow = w;
+  self.updateProgressBar = bar;
+  self.updateProgressText = text;
+  [w center];
+  [w orderFrontRegardless];
+}
+
+- (void)setUpdateProgress:(double)frac text:(NSString *)text {
+  if (!self.updateProgressWindow) return;
+  [self.updateProgressBar setIndeterminate:NO];
+  self.updateProgressBar.doubleValue = MAX(0, MIN(1, frac));
+  self.updateProgressText.stringValue = text;
+}
+
+- (void)failUpdateProgress:(NSString *)reason {
+  if (!self.updateProgressWindow) return;
+  [self.updateProgressBar setIndeterminate:YES];
+  [self.updateProgressBar startAnimation:nil];
+  self.updateProgressText.stringValue = [NSString stringWithFormat:@"更新失败：%@", reason];
+  self.countItem.title = @"更新失败";
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                 dispatch_get_main_queue(), ^{
+                   [self.updateProgressWindow orderOut:nil];
+                   self.updateProgressWindow = nil;
+                 });
+}
+
 /* 应用内下载 DMG 并自动挂载安装。应用自己下载的文件不带隔离标记，
    安装后不会出现任何 Gatekeeper 提示。 */
 - (void)downloadAndInstallUpdate:(NSString *)urlString {
   NSURL *url = [NSURL URLWithString:urlString];
   if (!url) return;
-  self.countItem.title = @"正在下载更新…";
-  if (self.window.isVisible) self.footer.stringValue = @"正在下载更新…";
+  [self beginUpdateProgress];
+  [self setUpdateProgress:0 text:@"正在连接…"];
   NSString *dst = [NSTemporaryDirectory() stringByAppendingPathComponent:@"MacEverything-update.dmg"];
   [NSFileManager.defaultManager removeItemAtPath:dst error:NULL];
-  NSURLSessionDownloadTask *task = [NSURLSession.sharedSession
-      downloadTaskWithURL:url
-        completionHandler:^(NSURL *location, NSURLResponse *response, NSError *error) {
-          (void)response;
-          dispatch_async(dispatch_get_main_queue(), ^{
-            if (error || !location) {
-              self.countItem.title = @"更新下载失败";
-              if (self.window.isVisible) self.footer.stringValue = @"更新下载失败";
-              return;
-            }
-            [NSFileManager.defaultManager removeItemAtPath:dst error:NULL];
-            BOOL ok = [NSFileManager.defaultManager moveItemAtURL:location
-                                                            toURL:[NSURL fileURLWithPath:dst]
-                                                            error:NULL];
-            if (!ok) {
-              self.countItem.title = @"更新下载失败";
-              return;
-            }
-            [self installDownloadedUpdate:dst];
-          });
-        }];
-  [task resume];
+  MEUpdateDownloader *dl = [MEUpdateDownloader new];
+  dl.destination = dst;
+  __weak AppDelegate *ws = self;
+  dl.onProgress = ^(double frac, int64_t written, int64_t total) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+      [ws setUpdateProgress:frac
+                       text:[NSString stringWithFormat:@"正在下载更新… %.1f / %.1f MB",
+                                                        written / 1048576.0, total / 1048576.0]];
+    });
+  };
+  dl.onDone = ^(NSURL *file, NSError *error) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+      if (!file) {
+        [ws failUpdateProgress:error.localizedDescription ?: @"下载失败"];
+        return;
+      }
+      [ws.updateProgressBar setIndeterminate:YES];
+      [ws.updateProgressBar startAnimation:nil];
+      [ws setUpdateProgress:1 text:@"正在安装更新…"];
+      [ws installDownloadedUpdate:file.path];
+    });
+  };
+  self.updateSessionDelegate = dl;
+  NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
+  self.updateSession = [NSURLSession sessionWithConfiguration:cfg delegate:dl delegateQueue:nil];
+  [[self.updateSession downloadTaskWithURL:url] resume];
 }
 
 /* 挂载已下载的 DMG，把卷内应用替换安装到 /Applications，剥离下载属性后重启。
    不直接启动卷内应用：网络下载的内容在新系统上会被 provenance/Gatekeeper 拦截。 */
 - (void)installDownloadedUpdate:(NSString *)dmgPath {
-  self.countItem.title = @"正在安装更新…";
-  if (self.window.isVisible) self.footer.stringValue = @"正在安装更新…";
+  [self setUpdateProgress:1 text:@"正在安装更新，即将重启…"];
   NSTask *t = [NSTask launchedTaskWithLaunchPath:@"/usr/bin/hdiutil"
                                       arguments:@[@"attach", dmgPath, @"-nobrowse", @"-quiet"]];
   [t waitUntilExit];
@@ -1685,8 +1833,7 @@ static NSString *CurrentVersion(void) {
     }
   }
   if (!volApp) {
-    self.countItem.title = @"更新安装失败";
-    if (self.window.isVisible) self.footer.stringValue = @"更新安装失败";
+    [self failUpdateProgress:@"更新卷中未找到应用"];
     [NSTask launchedTaskWithLaunchPath:@"/usr/bin/hdiutil"
                             arguments:@[@"detach", volRoot ?: @"", @"-quiet"] ];
     return;
@@ -1705,8 +1852,7 @@ static NSString *CurrentVersion(void) {
     [x2 waitUntilExit];
   }
   if (!ok) {
-    self.countItem.title = @"更新安装失败";
-    if (self.window.isVisible) self.footer.stringValue = @"更新安装失败";
+    [self failUpdateProgress:@"替换应用失败"];
     [NSTask launchedTaskWithLaunchPath:@"/usr/bin/hdiutil"
                             arguments:@[@"detach", volRoot, @"-quiet"]];
     return;
@@ -1718,8 +1864,13 @@ static NSString *CurrentVersion(void) {
        "hdiutil detach '%@' -quiet 2>/dev/null",
       getpid(), dstApp.path, volRoot] UTF8String], NULL};
   posix_spawn(&child, "/bin/sh", NULL, NULL, argv, environ);
-  self.skipSave = YES;
-  [NSApp terminate:nil];
+  if (child > 0) {
+    [self setUpdateProgress:1 text:@"安装完成，正在重启…"];
+    self.skipSave = YES;
+    [NSApp terminate:nil];
+    return;
+  }
+  [self failUpdateProgress:@"无法启动安装助手"];
 }
 
 - (void)remindCachedUpdateForce:(BOOL)force {
