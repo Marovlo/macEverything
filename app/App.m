@@ -673,7 +673,7 @@ static OSStatus HotkeyHandler(EventHandlerCallRef next, EventRef event, void *us
   (void)user;
   if (GetEventKind(event) == kEventHotKeyPressed) {
     dispatch_async(dispatch_get_main_queue(), ^{
-      [g_app showWindow];
+      [g_app toggleShowWindow]; /* 模拟 Spotlight：再按一次关闭 */
     });
   }
   return noErr;
@@ -885,11 +885,26 @@ static OSStatus HotkeyHandler(EventHandlerCallRef next, EventRef event, void *us
   return NO;
 }
 
+/* 热键呼出：窗口在视野内则关闭（Spotlight 式切换），否则呼出并居中。 */
+- (void)toggleShowWindow {
+  BOOL visible = self.window.isVisible && !self.window.miniaturized &&
+                 (self.window.occlusionState & NSWindowOcclusionStateVisible) != 0;
+  if (visible) {
+    [self.window orderOut:nil]; /* 关回菜单栏，自动进入后台省电模式 */
+  } else {
+    [self showWindowCentered:YES];
+  }
+}
+
 - (void)showWindow {
+  [self showWindowCentered:NO]; /* 状态栏图标/外部唤起：图标正下方 */
+}
+
+- (void)showWindowCentered:(BOOL)centered {
   if (NSApp.hidden) [NSApp unhide:nil];
   if (self.window.miniaturized) [self.window deminiaturize:nil];
   NSWindow *statusWin = self.status.button.window;
-  if (statusWin) {
+  if (!centered && statusWin) {
     NSRect sf = statusWin.frame;
     NSRect wf = self.window.frame;
     NSScreen *screen = statusWin.screen ?: NSScreen.mainScreen;
@@ -905,6 +920,18 @@ static OSStatus HotkeyHandler(EventHandlerCallRef next, EventRef event, void *us
   [NSApp activateIgnoringOtherApps:YES];
   [self.window orderFrontRegardless];
   [self.window makeKeyAndOrderFront:nil];
+  if (centered) {
+    /* 热键呼出：屏幕正中（在自动恢复框架之后设置，避免被覆盖） */
+    NSScreen *screen = NSScreen.mainScreen ?: NSScreen.screens.firstObject;
+    if (screen) {
+      NSRect vis = screen.visibleFrame;
+      NSRect wf = self.window.frame;
+      NSRect r = NSMakeRect(NSMidX(vis) - NSWidth(wf) / 2.0,
+                            NSMinY(vis) + (NSHeight(vis) - NSHeight(wf)) / 2.0,
+                            NSWidth(wf), NSHeight(wf));
+      [self.window setFrame:r display:YES];
+    }
+  }
   [self ensureWindowOnScreen];
   [self applyPowerMode];
   /* frameAutosaveName 的恢复发生在窗口真正显示时甚至稍晚，可能把窗口放回已断开的
