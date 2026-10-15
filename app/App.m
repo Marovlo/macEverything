@@ -65,9 +65,15 @@ static _Atomic uint64_t g_epoch = 0;
 @property BOOL fdaGrantedCached; /* 完全磁盘访问已授权（缓存） */
 @property BOOL fdaStateKnown;
 @property BOOL fdaCheckInFlight;
+@property(strong) NSTimer *tickTimer;     /* UI 状态轮询，前后台自适应间隔 */
+@property BOOL powerBackground;           /* 后台省电模式：窗口不在视野内 */
+@property uint64_t lastTickGen;           /* 上次 tick 处理过的索引代数 */
+@property(nonatomic, assign) MEIndex *lastTickIdx;
+@property(nonatomic, assign) MEIndex *powerWatchAppliedTo; /* 已应用省电模式的索引 */
 @end
 
 static AppDelegate *g_app = nil;
+static void *MEKvoOcclusion = &MEKvoOcclusion;
 
 @class AppDelegate;
 @interface MEScrollView : NSScrollView
@@ -222,7 +228,8 @@ static void OnIndexChange(void *ctx) {
   dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
     [self loadOrScan];
   });
-  [NSTimer scheduledTimerWithTimeInterval:0.3 target:self selector:@selector(tick) userInfo:nil repeats:YES];
+  [self applyPowerMode];
+  [self applyPowerTickInterval];
   [NSTimer scheduledTimerWithTimeInterval:10 target:self selector:@selector(checkpoint) userInfo:nil repeats:YES];
   [NSTimer scheduledTimerWithTimeInterval:3600 target:self selector:@selector(checkForUpdates) userInfo:nil repeats:YES];
   [self checkForUpdates];
@@ -417,6 +424,7 @@ static void OnIndexChange(void *ctx) {
     self.idx = idx;
     self.ready = YES;
     [self tick];
+    [self applyPowerMode];
     if (self.window.isVisible) [self scheduleSearch];
   });
 }
@@ -439,6 +447,7 @@ static void OnIndexChange(void *ctx) {
     self.fdaGrantedCached = !skipped;
     self.fdaStateKnown = YES;
     [self tick];
+    [self applyPowerMode];
     if (self.window.isVisible) [self scheduleSearch];
     if (old && old != fresh) {
       dispatch_async(self.searchQ, ^{
@@ -565,6 +574,10 @@ static void OnIndexChange(void *ctx) {
   self.window.collectionBehavior = NSWindowCollectionBehaviorMoveToActiveSpace | NSWindowCollectionBehaviorFullScreenAuxiliary;
   self.window.contentMinSize = NSMakeSize(520, 260);
   self.window.frameAutosaveName = @"MESearchWindow";
+  [self.window addObserver:self
+                forKeyPath:@"occlusionState"
+                   options:0
+                   context:MEKvoOcclusion];
   [self.window center];
   NSView *content = self.window.contentView;
   self.field = [NSSearchField new];
@@ -786,6 +799,7 @@ static OSStatus HotkeyHandler(EventHandlerCallRef next, EventRef event, void *us
   [self.window orderFrontRegardless];
   [self.window makeKeyAndOrderFront:nil];
   [self ensureWindowOnScreen];
+  [self applyPowerMode];
   /* frameAutosaveName 的恢复发生在窗口真正显示时甚至稍晚，可能把窗口放回已断开的
      显示器；延迟再校一次。 */
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
@@ -816,9 +830,48 @@ static OSStatus HotkeyHandler(EventHandlerCallRef next, EventRef event, void *us
   [self.window setFrame:r display:YES];
 }
 
+/* 前后台省电模式：窗口不在视野内时，UI 轮询与文件监视都降到 60 秒。 */
+- (void)applyPowerMode {
+  BOOL bg = !(self.window && (self.window.occlusionState & NSWindowOcclusionStateVisible) != 0 &&
+              !self.window.miniaturized);
+  if (bg == self.powerBackground && self.powerWatchAppliedTo == self.idx) return;
+  self.powerBackground = bg;
+  self.powerWatchAppliedTo = self.idx;
+  [self applyPowerTickInterval];
+  /* 文件监视切换到对应延迟；event_id 续传保证切换期间事件不丢 */
+  if (self.idx) me_index_watch_set_update_interval(self.idx, bg ? 60.0 : 0.15, bg ? 0 : 1);
+}
+
+- (void)applyPowerTickInterval {
+  double interval = self.powerBackground ? 60.0 : 0.3;
+  [self.tickTimer invalidate];
+  self.tickTimer = [NSTimer timerWithTimeInterval:interval
+                                           target:self
+                                         selector:@selector(tick)
+                                         userInfo:nil
+                                          repeats:YES];
+  [[NSRunLoop mainRunLoop] addTimer:self.tickTimer forMode:NSRunLoopCommonModes];
+}
+
+- (void)observeValueForKeyPath:(NSString *)keyPath
+                      ofObject:(id)object
+                        change:(NSDictionary *)change
+                       context:(void *)context {
+  if (context == MEKvoOcclusion) {
+    [self applyPowerMode];
+    return;
+  }
+  [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
+}
+
 - (void)tick {
+  if (self.powerBackground) return; /* 后台：计时器已降到 60s，无事可做 */
   MEIndex *idx = self.idx;
   if (!idx) return;
+  uint64_t gen = me_index_generation(idx);
+  BOOL changed = gen != self.lastTickGen || self.lastTickIdx != idx;
+  self.lastTickGen = gen;
+  self.lastTickIdx = idx;
   MEIndex *building = self.building;
   if (building && me_index_scanning(building)) {
     unsigned long long n = (unsigned long long)me_index_progress(building);
@@ -830,7 +883,7 @@ static OSStatus HotkeyHandler(EventHandlerCallRef next, EventRef event, void *us
     unsigned long long n = (unsigned long long)me_index_progress(idx);
     self.countItem.title = [NSString stringWithFormat:@"正在索引 %llu 个名称", n];
     if (self.window.isVisible) self.footer.stringValue = [NSString stringWithFormat:@"正在索引 %llu 个名称…", n];
-  } else if (self.ready) {
+  } else if (self.ready && changed) {
     self.countItem.title = [NSString stringWithFormat:@"已索引 %u 个名称", me_index_live(idx)];
   }
 }
@@ -1366,6 +1419,7 @@ static const uint32_t kSearchPage = 300;
       self.fdaGrantedCached = !skipped;
       self.fdaStateKnown = YES;
       [self tick];
+      [self applyPowerMode];
       if (self.window.isVisible) [self scheduleSearch];
     });
   });

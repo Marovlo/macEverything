@@ -93,6 +93,9 @@ int me_index_rescan(MEIndex *idx, const char *path);
 
 int me_index_watch_start(MEIndex *idx, void (*on_change)(void *ctx), void *ctx);
 void me_index_watch_stop(MEIndex *idx);
+/* 运行时调整事件批处理延迟（秒）。no_defer=1 时首批事件立即送达。
+   用于前后台省电切换：后台加大延迟减少唤醒。 */
+void me_index_watch_set_update_interval(MEIndex *idx, double latency_seconds, int no_defer);
 
 int me_default_index_path(char *buf, size_t cap);
 const char *me_last_error(void);

@@ -42,6 +42,52 @@ static void fs_callback(ConstFSEventStreamRef stream, void *info, size_t num, vo
   if (changed && idx->on_change) idx->on_change(idx->on_change_ctx);
 }
 
+static void watch_teardown_streams(MEIndex *idx) {
+  for (int i = 0; i < idx->stream_count; i++) {
+    FSEventStreamRef s = idx->streams[i];
+    if (!s) continue;
+    FSEventStreamStop(s);
+    FSEventStreamInvalidate(s);
+    FSEventStreamRelease(s);
+    idx->streams[i] = NULL;
+  }
+  idx->stream_count = 0;
+}
+
+/* 按当前延迟模式重建全部流；从根的 event_id 续传，切换期间事件不丢。 */
+static void watch_create_streams(MEIndex *idx) {
+  double latency = idx->watch_latency > 0 ? idx->watch_latency : 0.15;
+  int no_defer = idx->watch_no_defer;
+  dispatch_queue_t q = (dispatch_queue_t)idx->watch_q;
+  idx->stream_count = 0;
+  for (uint32_t i = 0; i < idx->root_count; i++) {
+    CFStringRef p = CFStringCreateWithFileSystemRepresentation(NULL, idx->roots[i].path);
+    if (!p) continue;
+    CFArrayRef arr = CFArrayCreate(NULL, (const void **)&p, 1, &kCFTypeArrayCallBacks);
+    CFRelease(p);
+    if (!arr) continue;
+    FSEventStreamContext context;
+    memset(&context, 0, sizeof context);
+    context.info = idx;
+    FSEventStreamEventId since = idx->roots[i].event_id ? idx->roots[i].event_id
+                                                        : kFSEventStreamEventIdSinceNow;
+    FSEventStreamEventFlags extra = no_defer ? (FSEventStreamEventFlags)kFSEventStreamCreateFlagNoDefer : 0;
+    FSEventStreamRef stream = FSEventStreamCreate(
+        NULL, fs_callback, &context, arr, since, latency,
+        kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagWatchRoot |
+            kFSEventStreamCreateFlagUseCFTypes | extra);
+    CFRelease(arr);
+    if (!stream) continue;
+    FSEventStreamSetDispatchQueue(stream, q);
+    if (!FSEventStreamStart(stream)) {
+      FSEventStreamInvalidate(stream);
+      FSEventStreamRelease(stream);
+      continue;
+    }
+    idx->streams[idx->stream_count++] = stream;
+  }
+}
+
 int me_index_watch_start(MEIndex *idx, void (*on_change)(void *ctx), void *ctx) {
   if (!idx) return -1;
   if (idx->watching) return 0;
@@ -55,32 +101,8 @@ int me_index_watch_start(MEIndex *idx, void (*on_change)(void *ctx), void *ctx) 
   idx->on_change = on_change;
   idx->on_change_ctx = ctx;
   idx->watching = 1;
-  idx->stream_count = 0;
-  for (uint32_t i = 0; i < idx->root_count; i++) {
-    CFStringRef p = CFStringCreateWithFileSystemRepresentation(NULL, idx->roots[i].path);
-    if (!p) continue;
-    CFArrayRef arr = CFArrayCreate(NULL, (const void **)&p, 1, &kCFTypeArrayCallBacks);
-    CFRelease(p);
-    if (!arr) continue;
-    FSEventStreamContext context;
-    memset(&context, 0, sizeof context);
-    context.info = idx;
-    FSEventStreamEventId since = idx->roots[i].event_id ? idx->roots[i].event_id
-                                                        : kFSEventStreamEventIdSinceNow;
-    FSEventStreamRef stream = FSEventStreamCreate(
-        NULL, fs_callback, &context, arr, since, 0.15,
-        kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer |
-            kFSEventStreamCreateFlagWatchRoot | kFSEventStreamCreateFlagUseCFTypes);
-    CFRelease(arr);
-    if (!stream) continue;
-    FSEventStreamSetDispatchQueue(stream, q);
-    if (!FSEventStreamStart(stream)) {
-      FSEventStreamInvalidate(stream);
-      FSEventStreamRelease(stream);
-      continue;
-    }
-    idx->streams[idx->stream_count++] = stream;
-  }
+  if (idx->watch_latency <= 0) idx->watch_latency = 0.15;
+  watch_create_streams(idx);
   if (idx->stream_count == 0) {
     idx->watching = 0;
     dispatch_release(q);
@@ -118,4 +140,18 @@ void me_index_watch_stop(MEIndex *idx) {
   }
   idx->on_change = NULL;
   idx->on_change_ctx = NULL;
+}
+
+void me_index_watch_set_update_interval(MEIndex *idx, double latency_seconds, int no_defer) {
+  if (!idx || !idx->watching) return;
+  dispatch_queue_t q = (dispatch_queue_t)idx->watch_q;
+  if (!q) return;
+  /* 在监视队列上串行执行：等在途回调结束后再拆除重建，避免竞态 */
+  dispatch_async(q, ^{
+    if (!idx->watching) return;
+    watch_teardown_streams(idx);
+    idx->watch_latency = latency_seconds > 0 ? latency_seconds : 0.15;
+    idx->watch_no_defer = no_defer ? 1 : 0;
+    watch_create_streams(idx);
+  });
 }

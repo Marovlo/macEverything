@@ -326,6 +326,13 @@ static void test_watch(void) {
   CHECK(info.size == 5);
   unlink(file);
   CHECK(wait_total(idx, "me-watch-token", 0, 4000));
+  /* 运行时切换延迟后，事件仍正常送达 */
+  me_index_watch_set_update_interval(idx, 1.0, 0);
+  snprintf(file, sizeof file, "%s/me-watch-token2.txt", root);
+  write_file(file, "hey");
+  CHECK(wait_total(idx, "me-watch-token2", 1, 8000));
+  unlink(file);
+  CHECK(wait_total(idx, "me-watch-token2", 0, 8000));
   if (g_failed) fprintf(stderr, "watch error: %s\n", me_last_error());
   me_index_free(idx);
   rmdir(root);

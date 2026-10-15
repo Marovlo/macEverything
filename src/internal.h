@@ -75,6 +75,8 @@ struct MEIndex {
   void (*on_change)(void *);
   void *on_change_ctx;
   int watching;
+  double watch_latency;
+  int watch_no_defer;
 };
 
 int me_fold(const char *src, size_t src_len, char *dst, size_t dst_cap,
