@@ -40,6 +40,7 @@ static _Atomic uint64_t g_epoch = 0;
 @property(strong) NSSearchField *field;
 @property(strong) NSTableView *table;
 @property(strong) NSTextField *footer;
+@property(strong) NSTextField *versionLabel;
 @property(strong) NSMutableArray<MERow *> *rows;
 @property(strong) NSString *indexPath;
 @property(strong) NSString *rootPath;
@@ -651,8 +652,15 @@ static void OnIndexChange(void *ctx) {
   [content addSubview:scroll];
   self.footer = [NSTextField labelWithString:@"输入文件名"];
   self.footer.font = [NSFont systemFontOfSize:12];
+  self.footer.lineBreakMode = NSLineBreakByTruncatingTail;
+  self.footer.cell.wraps = NO;
   self.footer.textColor = NSColor.secondaryLabelColor;
   [content addSubview:self.footer];
+  NSString *ver = [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?";
+  self.versionLabel = [NSTextField labelWithString:[NSString stringWithFormat:@"v%@", ver]];
+  self.versionLabel.font = [NSFont systemFontOfSize:11];
+  self.versionLabel.textColor = NSColor.tertiaryLabelColor;
+  [content addSubview:self.versionLabel];
   self.field.translatesAutoresizingMaskIntoConstraints = NO;
   scroll.translatesAutoresizingMaskIntoConstraints = NO;
   self.footer.translatesAutoresizingMaskIntoConstraints = NO;
@@ -665,8 +673,12 @@ static void OnIndexChange(void *ctx) {
     [scroll.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-12],
     [scroll.bottomAnchor constraintEqualToAnchor:self.footer.topAnchor constant:-8],
     [self.footer.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:14],
-    [self.footer.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-14],
+    [self.footer.trailingAnchor constraintLessThanOrEqualToAnchor:self.versionLabel.leadingAnchor constant:-12],
     [self.footer.bottomAnchor constraintEqualToAnchor:content.bottomAnchor constant:-10],
+    [self.versionLabel.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-14],
+    [self.versionLabel.centerYAnchor constraintEqualToAnchor:self.footer.centerYAnchor],
+    [self.versionLabel.leadingAnchor
+        constraintGreaterThanOrEqualToAnchor:self.footer.trailingAnchor constant:12],
   ]];
 }
 
@@ -1648,7 +1660,8 @@ static NSString *CurrentVersion(void) {
   [task resume];
 }
 
-/* 挂载已下载的 DMG 并启动卷内应用——复用 DMG 自动替换安装 + 重启链路。 */
+/* 挂载已下载的 DMG，把卷内应用替换安装到 /Applications，剥离下载属性后重启。
+   不直接启动卷内应用：网络下载的内容在新系统上会被 provenance/Gatekeeper 拦截。 */
 - (void)installDownloadedUpdate:(NSString *)dmgPath {
   self.countItem.title = @"正在安装更新…";
   if (self.window.isVisible) self.footer.stringValue = @"正在安装更新…";
@@ -1674,15 +1687,36 @@ static NSString *CurrentVersion(void) {
   if (!volApp) {
     self.countItem.title = @"更新安装失败";
     if (self.window.isVisible) self.footer.stringValue = @"更新安装失败";
+    [NSTask launchedTaskWithLaunchPath:@"/usr/bin/hdiutil"
+                            arguments:@[@"detach", volRoot ?: @"", @"-quiet"] ];
     return;
   }
-  /* 交接给独立小进程：等自己退出后打开卷内应用（自动替换 /Applications 并重启），
-     然后卸载更新卷。 */
+  NSFileManager *fm = NSFileManager.defaultManager;
+  NSURL *dstApp = [NSURL fileURLWithPath:@"/Applications/MacEverything.app"];
+  [fm removeItemAtURL:dstApp error:NULL];
+  BOOL ok = [fm copyItemAtURL:[NSURL fileURLWithPath:volApp] toURL:dstApp error:NULL];
+  if (ok) {
+    /* 剥离下载属性：quarantine/provenance 不清除会被 Gatekeeper 拦截 */
+    NSTask *x1 = [NSTask launchedTaskWithLaunchPath:@"/usr/bin/xattr"
+                                          arguments:@[@"-dr", @"com.apple.quarantine", dstApp.path]];
+    [x1 waitUntilExit];
+    NSTask *x2 = [NSTask launchedTaskWithLaunchPath:@"/usr/bin/xattr"
+                                          arguments:@[@"-dr", @"com.apple.provenance", dstApp.path]];
+    [x2 waitUntilExit];
+  }
+  if (!ok) {
+    self.countItem.title = @"更新安装失败";
+    if (self.window.isVisible) self.footer.stringValue = @"更新安装失败";
+    [NSTask launchedTaskWithLaunchPath:@"/usr/bin/hdiutil"
+                            arguments:@[@"detach", volRoot, @"-quiet"]];
+    return;
+  }
+  /* 交接给独立小进程：等自己退出后打开安装好的新版本，然后卸载更新卷。 */
   pid_t child = -1;
   char *argv[] = {"/bin/sh", "-c", (char *)[[NSString stringWithFormat:
       @"while kill -0 %d 2>/dev/null; do sleep 0.2; done; open '%@'; sleep 8; "
        "hdiutil detach '%@' -quiet 2>/dev/null",
-      getpid(), volApp, volRoot] UTF8String], NULL};
+      getpid(), dstApp.path, volRoot] UTF8String], NULL};
   posix_spawn(&child, "/bin/sh", NULL, NULL, argv, environ);
   self.skipSave = YES;
   [NSApp terminate:nil];
