@@ -70,6 +70,7 @@ static _Atomic uint64_t g_epoch = 0;
 @property uint64_t lastTickGen;           /* 上次 tick 处理过的索引代数 */
 @property(nonatomic, assign) MEIndex *lastTickIdx;
 @property(nonatomic, assign) MEIndex *powerWatchAppliedTo; /* 已应用省电模式的索引 */
+@property BOOL cmdSpaceOK;                /* 已接管 ⌘Space */
 @end
 
 static AppDelegate *g_app = nil;
@@ -131,6 +132,11 @@ static void OnIndexChange(void *ctx) {
   [[NSDistributedNotificationCenter defaultCenter] addObserver:self
                                                       selector:@selector(peerActivate:)
                                                            name:MEActivateNotification
+                                                         object:nil];
+  /* 系统设置里修改快捷键时立即尝试接管 ⌘Space */
+  [[NSDistributedNotificationCenter defaultCenter] addObserver:self
+                                                      selector:@selector(tryRegisterCmdSpace)
+                                                           name:@"com.apple.symbolichotkeys.changed"
                                                          object:nil];
   if ([NSBundle.mainBundle.bundlePath hasPrefix:@"/Volumes/"] && ![self hasLaunchFlag:@"--from-install"]) {
     [self installToApplicationsAndRelaunch];
@@ -666,12 +672,28 @@ static OSStatus HotkeyHandler(EventHandlerCallRef next, EventRef event, void *us
 
 - (void)registerHotkey {
   EventHotKeyID hid = {'MEVY', 1};
-  EventHotKeyRef ref = NULL;
-  OSStatus err = RegisterEventHotKey(kVK_Space, controlKey | optionKey, hid, GetApplicationEventTarget(), 0, &ref);
+  OSStatus err = RegisterEventHotKey(kVK_Space, controlKey | optionKey, hid, GetApplicationEventTarget(), 0, NULL);
   EventTypeSpec spec = {kEventClassKeyboard, kEventHotKeyPressed};
   InstallApplicationEventHandler(HotkeyHandler, 1, &spec, NULL, NULL);
   if (err != noErr) {
     self.footer.stringValue = @"全局快捷键 ⌃⌥Space 注册失败，可能被其他应用占用";
+  }
+  [self tryRegisterCmdSpace];
+}
+
+/* ⌘Space 属于系统 Spotlight：只有用户在系统设置 → 键盘 → 快捷键 → Spotlight
+   里关闭它的 ⌘Space 后，我们才能注册接管。Spotlight 开着时每小时重试一次。 */
+- (void)tryRegisterCmdSpace {
+  if (self.cmdSpaceOK) return;
+  NSDictionary *sh = CFBridgingRelease(CFPreferencesCopyAppValue(CFSTR("AppleSymbolicHotKeys"),
+                                                                 CFSTR("com.apple.symbolichotkeys")));
+  NSDictionary *h64 = sh[@"64"]; /* 64 = "显示 Spotlight 搜索" */
+  BOOL spotlightEnabled = h64 ? [h64[@"enabled"] boolValue] : YES;
+  if (spotlightEnabled) return;
+  EventHotKeyID hid = {'MEVY', 1};
+  if (RegisterEventHotKey(kVK_Space, cmdKey, hid, GetApplicationEventTarget(), 0, NULL) == noErr) {
+    self.cmdSpaceOK = YES;
+    self.status.button.toolTip = @"MacEverything  ⌘Space / ⌃⌥Space 呼出，右键菜单";
   }
 }
 
@@ -1550,6 +1572,7 @@ static NSString *CurrentVersion(void) {
 }
 
 - (void)checkForUpdates {
+  [self tryRegisterCmdSpace]; /* 用户关闭 Spotlight 快捷键后自动接管 ⌘Space */
   [self checkForUpdatesForce:NO];
 }
 

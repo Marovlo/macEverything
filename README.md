@@ -27,7 +27,7 @@ macOS 下的文件名即时搜索工具，灵感来自 Windows 上的 [Everythin
 
 | 操作 | 方式 |
 |---|---|
-| 呼出搜索窗口 | ⌃⌥Space 或点击菜单栏 🔍 ME 图标 |
+| 呼出搜索窗口 | ⌃⌥Space（默认）或菜单栏 🔍 ME 图标；关闭 Spotlight 的 ⌘Space 后自动接管 ⌘Space |
 | 打开文件 | 双击 |
 | 在 Finder 中显示 | ⌘R 或右键菜单 |
 | 拷贝路径 | ⌘C 或右键菜单 |
