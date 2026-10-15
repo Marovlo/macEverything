@@ -305,9 +305,11 @@ static void OnIndexChange(void *ctx) {
       }
       // 不能直接 openApplicationAtURL：自己还活着时 LS 会把请求路由给运行中的实例。
       // 派生一个独立小进程，等自己完全退出后再打开安装好的副本（普通启动路径）。
+      NSString *vol = [src.path stringByDeletingLastPathComponent]; /* 更新卷，交接后卸载 */
       pid_t child = -1;
       char *argv[] = {"/bin/sh", "-c", (char *)[[NSString stringWithFormat:
-          @"while kill -0 %d 2>/dev/null; do sleep 0.2; done; open %@", getpid(), dst.path] UTF8String], NULL};
+          @"while kill -0 %d 2>/dev/null; do sleep 0.2; done; open %@; sleep 8; "
+           "hdiutil detach '%@' -quiet 2>/dev/null", getpid(), dst.path, vol] UTF8String], NULL};
       int rc = posix_spawn(&child, "/bin/sh", NULL, NULL, argv, environ);
       if (rc != 0) {
         [self finishLaunch];
@@ -1594,8 +1596,9 @@ static NSString *CurrentVersion(void) {
   NSAlert *alert = [NSAlert new];
   alert.messageText = title;
   alert.informativeText = detail ?: @"";
+  BOOL inApp = [download.lowercaseString hasSuffix:@".dmg"];
   if (download.length) {
-    [alert addButtonWithTitle:@"下载更新"];
+    [alert addButtonWithTitle:inApp ? @"下载并安装" : @"打开下载页"];
     [alert addButtonWithTitle:@"稍后"];
   } else {
     [alert addButtonWithTitle:@"好"];
@@ -1603,9 +1606,86 @@ static NSString *CurrentVersion(void) {
   [NSApp activateIgnoringOtherApps:YES];
   NSModalResponse response = [alert runModal];
   if (download.length && response == NSAlertFirstButtonReturn) {
-    NSURL *url = [NSURL URLWithString:download];
-    if (url) [NSWorkspace.sharedWorkspace openURL:url];
+    if (inApp) {
+      [self downloadAndInstallUpdate:download];
+    } else {
+      NSURL *url = [NSURL URLWithString:download];
+      if (url) [NSWorkspace.sharedWorkspace openURL:url];
+    }
   }
+}
+
+/* 应用内下载 DMG 并自动挂载安装。应用自己下载的文件不带隔离标记，
+   安装后不会出现任何 Gatekeeper 提示。 */
+- (void)downloadAndInstallUpdate:(NSString *)urlString {
+  NSURL *url = [NSURL URLWithString:urlString];
+  if (!url) return;
+  self.countItem.title = @"正在下载更新…";
+  if (self.window.isVisible) self.footer.stringValue = @"正在下载更新…";
+  NSString *dst = [NSTemporaryDirectory() stringByAppendingPathComponent:@"MacEverything-update.dmg"];
+  [NSFileManager.defaultManager removeItemAtPath:dst error:NULL];
+  NSURLSessionDownloadTask *task = [NSURLSession.sharedSession
+      downloadTaskWithURL:url
+        completionHandler:^(NSURL *location, NSURLResponse *response, NSError *error) {
+          (void)response;
+          dispatch_async(dispatch_get_main_queue(), ^{
+            if (error || !location) {
+              self.countItem.title = @"更新下载失败";
+              if (self.window.isVisible) self.footer.stringValue = @"更新下载失败";
+              return;
+            }
+            [NSFileManager.defaultManager removeItemAtPath:dst error:NULL];
+            BOOL ok = [NSFileManager.defaultManager moveItemAtURL:location
+                                                            toURL:[NSURL fileURLWithPath:dst]
+                                                            error:NULL];
+            if (!ok) {
+              self.countItem.title = @"更新下载失败";
+              return;
+            }
+            [self installDownloadedUpdate:dst];
+          });
+        }];
+  [task resume];
+}
+
+/* 挂载已下载的 DMG 并启动卷内应用——复用 DMG 自动替换安装 + 重启链路。 */
+- (void)installDownloadedUpdate:(NSString *)dmgPath {
+  self.countItem.title = @"正在安装更新…";
+  if (self.window.isVisible) self.footer.stringValue = @"正在安装更新…";
+  NSTask *t = [NSTask launchedTaskWithLaunchPath:@"/usr/bin/hdiutil"
+                                      arguments:@[@"attach", dmgPath, @"-nobrowse", @"-quiet"]];
+  [t waitUntilExit];
+  NSString *volApp = nil, *volRoot = nil;
+  NSString *preferred = @"/Volumes/MacEverything/MacEverything.app";
+  if ([NSFileManager.defaultManager fileExistsAtPath:preferred]) {
+    volApp = preferred;
+    volRoot = @"/Volumes/MacEverything";
+  } else {
+    for (NSString *v in [NSFileManager.defaultManager contentsOfDirectoryAtPath:@"/Volumes" error:NULL]) {
+      if (![v hasPrefix:@"MacEverything"]) continue;
+      NSString *c = [NSString stringWithFormat:@"/Volumes/%@/MacEverything.app", v];
+      if ([NSFileManager.defaultManager fileExistsAtPath:c]) {
+        volApp = c;
+        volRoot = [@"/Volumes/" stringByAppendingString:v];
+        break;
+      }
+    }
+  }
+  if (!volApp) {
+    self.countItem.title = @"更新安装失败";
+    if (self.window.isVisible) self.footer.stringValue = @"更新安装失败";
+    return;
+  }
+  /* 交接给独立小进程：等自己退出后打开卷内应用（自动替换 /Applications 并重启），
+     然后卸载更新卷。 */
+  pid_t child = -1;
+  char *argv[] = {"/bin/sh", "-c", (char *)[[NSString stringWithFormat:
+      @"while kill -0 %d 2>/dev/null; do sleep 0.2; done; open '%@'; sleep 8; "
+       "hdiutil detach '%@' -quiet 2>/dev/null",
+      getpid(), volApp, volRoot] UTF8String], NULL};
+  posix_spawn(&child, "/bin/sh", NULL, NULL, argv, environ);
+  self.skipSave = YES;
+  [NSApp terminate:nil];
 }
 
 - (void)remindCachedUpdateForce:(BOOL)force {
@@ -1625,7 +1705,7 @@ static NSString *CurrentVersion(void) {
   [d setObject:NSDate.date forKey:@"MELastUpdateRemind"];
   NSString *page = url.length ? url : @"https://github.com/Marovlo/macEverything/releases/latest";
   [self showUpdateAlert:[NSString stringWithFormat:@"发现新版本 %@", latest]
-                  detail:[NSString stringWithFormat:@"当前版本是 %@。下载安装包后，把新的 MacEverything 拖进「应用程序」替换旧的。", CurrentVersion()]
+                  detail:[NSString stringWithFormat:@"当前版本是 %@。将自动下载并替换安装，完成后自动重启。", CurrentVersion()]
                 download:page];
 }
 
@@ -1639,46 +1719,66 @@ static NSString *CurrentVersion(void) {
     return;
   }
   self.updateCheckInFlight = YES;
+  [self fetchLatestViaAtomForce:force];
+}
+
+/* 更新检查收尾：tag 非空成功缓存并提醒；为空表示检查失败。 */
+- (void)finishUpdateCheckWithTag:(NSString *)tag force:(BOOL)force {
+  self.updateCheckInFlight = NO;
+  NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+  if (!tag.length) {
+    if (force) [self showUpdateAlert:@"暂时无法检查更新" detail:@"请稍后再试。" download:nil];
+    else [self remindCachedUpdateForce:NO];
+    return;
+  }
+  [d setObject:NSDate.date forKey:@"MELastUpdateCheck"];
+  NSString *dmg = [NSString stringWithFormat:
+      @"https://github.com/Marovlo/macEverything/releases/download/%@/MacEverything.dmg", tag];
+  [d setObject:tag forKey:@"MELatestVersion"];
+  [d setObject:dmg forKey:@"MELatestURL"];
+  [self remindCachedUpdateForce:force];
+}
+
+/* 主通道：Releases Atom 订阅源（github.com 托管，无 API 限流）。 */
+- (void)fetchLatestViaAtomForce:(BOOL)force {
+  NSURL *feed = [NSURL URLWithString:@"https://github.com/Marovlo/macEverything/releases.atom"];
+  [[[NSURLSession sharedSession] dataTaskWithRequest:[NSMutableURLRequest requestWithURL:feed]
+    completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+      (void)response;
+      dispatch_async(dispatch_get_main_queue(), ^{
+        NSString *tag = nil;
+        if (data && !error) {
+          NSXMLDocument *doc = [[NSXMLDocument alloc] initWithData:data options:0 error:NULL];
+          if (doc) {
+            NSString *href = [[doc nodesForXPath:@"//entry/link/@href" error:NULL].firstObject stringValue];
+            if (href.length) tag = href.lastPathComponent; /* .../releases/tag/v1.2.2 */
+            if (!tag.length) tag = [[doc nodesForXPath:@"//entry/title" error:NULL].firstObject stringValue];
+          }
+        }
+        if (tag.length) {
+          [self finishUpdateCheckWithTag:tag force:force];
+          return;
+        }
+        [self fetchLatestViaAPIForce:force]; /* atom 失败回落 API */
+      });
+  }] resume];
+}
+
+/* 回落通道：GitHub API（有每小时限流）。 */
+- (void)fetchLatestViaAPIForce:(BOOL)force {
   NSURL *api = [NSURL URLWithString:@"https://api.github.com/repos/Marovlo/macEverything/releases/latest"];
   NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:api];
   [req setValue:@"MacEverything" forHTTPHeaderField:@"User-Agent"];
   [req setValue:@"application/vnd.github+json" forHTTPHeaderField:@"Accept"];
   [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
     dispatch_async(dispatch_get_main_queue(), ^{
-      self.updateCheckInFlight = NO;
+      NSString *tag = nil;
       NSHTTPURLResponse *http = [response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)response : nil;
-      if (error || !data || http.statusCode != 200) {
-        if (force) [self showUpdateAlert:@"暂时无法检查更新" detail:@"请稍后再试。" download:nil];
-        else [self remindCachedUpdateForce:NO];
-        return;
+      if (!error && data && http.statusCode == 200) {
+        id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
+        if ([json isKindOfClass:[NSDictionary class]]) tag = json[@"tag_name"];
       }
-      id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
-      if (![json isKindOfClass:[NSDictionary class]]) {
-        if (force) [self showUpdateAlert:@"暂时无法检查更新" detail:@"请稍后再试。" download:nil];
-        return;
-      }
-      [d setObject:NSDate.date forKey:@"MELastUpdateCheck"];
-      NSString *tag = json[@"tag_name"];
-      NSString *page = json[@"html_url"];
-      NSString *dmg = [page isKindOfClass:[NSString class]] ? page : nil;
-      NSArray *assets = json[@"assets"];
-      if ([assets isKindOfClass:[NSArray class]]) {
-        for (id asset in assets) {
-          if (![asset isKindOfClass:[NSDictionary class]]) continue;
-          NSString *name = asset[@"name"];
-          NSString *file = asset[@"browser_download_url"];
-          if ([name isKindOfClass:[NSString class]] && [file isKindOfClass:[NSString class]] &&
-              [name.lowercaseString hasSuffix:@".dmg"]) {
-            dmg = file;
-            break;
-          }
-        }
-      }
-      if ([tag isKindOfClass:[NSString class]] && tag.length) {
-        [d setObject:tag forKey:@"MELatestVersion"];
-        if (dmg.length) [d setObject:dmg forKey:@"MELatestURL"];
-      }
-      [self remindCachedUpdateForce:force];
+      [self finishUpdateCheckWithTag:[tag isKindOfClass:[NSString class]] ? tag : nil force:force];
     });
   }] resume];
 }
