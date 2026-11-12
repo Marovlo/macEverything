@@ -2,7 +2,7 @@ CC := clang
 CFLAGS := -std=c11 -O3 -Wall -Wextra -Werror -Isrc -Iinclude -D_DARWIN_C_SOURCE -fblocks
 OBJCFLAGS := -fobjc-arc $(CFLAGS)
 LDFLAGS := -framework CoreFoundation -framework CoreServices
-APP_LDFLAGS := $(LDFLAGS) -framework Foundation -framework AppKit -framework Carbon -framework UniformTypeIdentifiers
+APP_LDFLAGS := $(LDFLAGS) -framework Foundation -framework AppKit -framework Carbon -framework UniformTypeIdentifiers -framework IOKit
 
 CORE := src/util.c src/fold.c src/index.c src/search.c src/scan.c src/persist.c src/watch.c
 CORE_OBJ := $(CORE:src/%.c=build/%.o)

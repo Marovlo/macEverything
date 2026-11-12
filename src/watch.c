@@ -5,6 +5,7 @@
 #include <dispatch/dispatch.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 static void fs_callback(ConstFSEventStreamRef stream, void *info, size_t num, void *event_paths,
@@ -14,6 +15,12 @@ static void fs_callback(ConstFSEventStreamRef stream, void *info, size_t num, vo
   if (!idx || !idx->watching) return;
   CFArrayRef paths = (CFArrayRef)event_paths;
   int changed = 0;
+  /* 重扫风暴防护：同批次只做一次全量重扫；同路径 5 秒内不重复重扫，
+     重复事件退化为单路径刷新（incremental 状态由下次批次兜底）。 */
+  static char lastRescanPath[16 * 1024];
+  static double lastRescanAt = 0;
+  static int batchRescans = 0;
+  batchRescans = 0;
   for (size_t i = 0; i < num; i++) {
     char buf[16 * 1024];
     CFStringRef s = CFArrayGetValueAtIndex(paths, (CFIndex)i);
@@ -29,6 +36,22 @@ static void fs_callback(ConstFSEventStreamRef stream, void *info, size_t num, vo
     changed = 1;
     if (f & (kFSEventStreamEventFlagUserDropped | kFSEventStreamEventFlagKernelDropped |
              kFSEventStreamEventFlagRootChanged | kFSEventStreamEventFlagMustScanSubDirs)) {
+      struct timespec ts;
+      clock_gettime(CLOCK_MONOTONIC, &ts);
+      double now = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+      int samePath = lastRescanPath[0] && strcmp(buf, lastRescanPath) == 0;
+      if (batchRescans > 0 || (samePath && now - lastRescanAt < 5.0)) {
+        me_index_refresh_path(idx, buf);
+        continue;
+      }
+      snprintf(lastRescanPath, sizeof lastRescanPath, "%s", buf);
+      lastRescanAt = now;
+      batchRescans++;
+      FILE *rf = fopen("/tmp/me-rescan.log", "a");
+      if (rf) {
+        fprintf(rf, "rescan %.3f %s\n", now, buf);
+        fclose(rf);
+      }
       me_index_rescan(idx, buf);
       continue;
     }

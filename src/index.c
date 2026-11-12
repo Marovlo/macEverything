@@ -341,6 +341,13 @@ int me_should_skip(const char *parent_base, size_t parent_len, const char *name,
     if (name_len == 10 && memcmp(name, "Containers", 10) == 0) return 1;
     if (name_len == 16 && memcmp(name, "Group Containers", 16) == 0) return 1;
     if (name_len == 17 && memcmp(name, "Daemon Containers", 17) == 0) return 1;
+    /* iCloud Drive 与第三方云盘挂载：持续产生 MustScanSubDirs 事件风暴 */
+    if (name_len == 16 && memcmp(name, "Mobile Documents", 16) == 0) return 1;
+    if (name_len == 12 && memcmp(name, "CloudStorage", 12) == 0) return 1;
+  }
+  /* 自身数据目录与备份：写盘会触发自我监视循环（重扫风暴） */
+  if (parent_len == 19 && memcmp(parent_base, "Application Support", 19) == 0) {
+    if (name_len >= 13 && memcmp(name, "MacEverything", 13) == 0) return 1;
   }
   return 0;
 }
@@ -374,13 +381,13 @@ static int ignored_under_root(const MEIndex *idx, const char *path, int *found) 
 
 int me_path_ignored(const MEIndex *idx, const char *path) {
   if (!path) return 1;
-  if (strstr(path, "/MacEverything/index.bin")) return 1;
+  if (strstr(path, "/Application Support/MacEverything")) return 1;
   int found = 0;
   int ign = ignored_under_root(idx, path, &found);
   if (found) return ign;
   char canon[8192];
   if (canonicalize_path(path, canon, sizeof canon) != 0 || strcmp(canon, path) == 0) return 1;
-  if (strstr(canon, "/MacEverything/index.bin")) return 1;
+  if (strstr(canon, "/Application Support/MacEverything")) return 1;
   return ignored_under_root(idx, canon, &found);
 }
 

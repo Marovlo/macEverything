@@ -1,6 +1,8 @@
 #import <AppKit/AppKit.h>
 #import <Carbon/Carbon.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#import <IOKit/ps/IOPowerSources.h>
+#import <IOKit/ps/IOPSKeys.h>
 
 #include <fcntl.h>
 
@@ -79,6 +81,7 @@ static _Atomic uint64_t g_epoch = 0;
 @property(strong) NSURLSession *updateSession;
 @property(strong) id updateSessionDelegate;
 @property void *cmdSpaceHotKey;           /* ⌘Space 热键句柄，用于取消注册 */
+@property double powerWatchLatency;       /* 已应用到文件监视的延迟 */
 @end
 
 static AppDelegate *g_app = nil;
@@ -1073,16 +1076,48 @@ static OSStatus HotkeyHandler(EventHandlerCallRef next, EventRef event, void *us
   [self.window setFrame:wf display:YES];
 }
 
+/* 当前是否由电池供电（IOKit 电源源状态）。 */
+- (BOOL)onBatteryPower {
+  CFTypeRef blob = IOPSCopyPowerSourcesInfo();
+  CFArrayRef list = blob ? IOPSCopyPowerSourcesList(blob) : NULL;
+  BOOL battery = NO;
+  for (id src in (__bridge NSArray *)list) {
+    CFDictionaryRef desc = IOPSGetPowerSourceDescription(blob, (__bridge CFTypeRef)src);
+    if (!desc) continue;
+    CFStringRef state = CFDictionaryGetValue(desc, CFSTR(kIOPSPowerSourceStateKey));
+    if (state && CFStringCompare(state, CFSTR(kIOPSBatteryPowerValue), 0) == 0) {
+      battery = YES;
+      break;
+    }
+  }
+  if (list) CFRelease(list);
+  if (blob) CFRelease(blob);
+  return battery;
+}
+
 /* 前后台省电模式：窗口不在视野内时，UI 轮询与文件监视都降到 60 秒。 */
 - (void)applyPowerMode {
   BOOL bg = !(self.window && (self.window.occlusionState & NSWindowOcclusionStateVisible) != 0 &&
               !self.window.miniaturized);
-  if (bg == self.powerBackground && self.powerWatchAppliedTo == self.idx) return;
+  /* 文件监视延迟：前台 AC 0.15s 实时；前台电池 2s 合并；后台 60s */
+  double latency = 0.15;
+  int noDefer = 1;
+  if (bg) {
+    latency = 60.0;
+    noDefer = 0;
+  } else if ([self onBatteryPower]) {
+    latency = 2.0;
+    noDefer = 0;
+  }
+  if (bg == self.powerBackground && self.powerWatchAppliedTo == self.idx &&
+      self.powerWatchLatency == latency)
+    return;
   self.powerBackground = bg;
   self.powerWatchAppliedTo = self.idx;
+  self.powerWatchLatency = latency;
   [self applyPowerTickInterval];
   /* 文件监视切换到对应延迟；event_id 续传保证切换期间事件不丢 */
-  if (self.idx) me_index_watch_set_update_interval(self.idx, bg ? 60.0 : 0.15, bg ? 0 : 1);
+  if (self.idx) me_index_watch_set_update_interval(self.idx, latency, noDefer);
 }
 
 - (void)applyPowerTickInterval {
@@ -1109,6 +1144,14 @@ static OSStatus HotkeyHandler(EventHandlerCallRef next, EventRef event, void *us
 
 - (void)tick {
   if (self.powerBackground) return; /* 后台：计时器已降到 60s，无事可做 */
+  { /* 每 5 秒重估一次电源状态（插拔电池切换监视延迟） */
+    static double lastPowerCheck = 0;
+    double now = [NSDate.date timeIntervalSince1970];
+    if (now - lastPowerCheck >= 5.0) {
+      lastPowerCheck = now;
+      [self applyPowerMode];
+    }
+  }
   MEIndex *idx = self.idx;
   if (!idx) return;
   uint64_t gen = me_index_generation(idx);
